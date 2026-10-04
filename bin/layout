@@ -99,13 +99,25 @@ def dispatch(expr: str) -> bool:
     return True
 
 
+def norm_address(value: str) -> str:
+    """Canonical window address.
+
+    The event socket prints addresses without the `0x` prefix while `hyprctl clients -j` prints them
+    with it, so every address has to be normalised before it is compared or stored.
+    """
+    text = value[len("address:"):] if value.startswith("address:") else value
+    text = text.strip().lower()
+    return text if text.startswith("0x") else "0x" + text
+
+
 def clients() -> list[dict]:
     return hyprctl_json("clients") or []
 
 
 def client_by_address(address: str) -> dict | None:
+    wanted = norm_address(address)
     for client in clients():
-        if client.get("address") == address:
+        if norm_address(str(client.get("address") or "")) == wanted:
             return client
     return None
 
@@ -113,17 +125,6 @@ def client_by_address(address: str) -> dict | None:
 def on_workspace(client: dict, workspace: str) -> bool:
     info = client.get("workspace") or {}
     return str(info.get("id")) == str(workspace) or info.get("name") == workspace
-
-
-def wait_mapped(address: str, timeout: float = 10.0) -> bool:
-    """A move dispatched right after `openwindow` is dropped; wait until the window is mapped."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        client = client_by_address(address)
-        if client and client.get("mapped"):
-            return True
-        time.sleep(0.2)
-    return False
 
 
 # --------------------------------------------------------------------------- profile traversal
@@ -282,7 +283,7 @@ def watch_openwindows(deadline: float, log):
                     continue
                 parts = text[len("openwindow>>"):].split(",")
                 if len(parts) >= 3:
-                    yield "address:" + parts[0], parts[2]
+                    yield "address:" + norm_address(parts[0]), parts[2]
     finally:
         conn.close()
 
@@ -291,15 +292,15 @@ def poll_openwindows(deadline: float):
     seen: set[str] = set()
     while time.monotonic() < deadline:
         for client in clients():
-            address = client.get("address")
-            if address and address not in seen and (client.get("mapped") or 0):
+            address = norm_address(str(client.get("address") or ""))
+            if address not in seen and (client.get("mapped") or 0):
                 seen.add(address)
                 yield "address:" + address, client.get("class")
         time.sleep(0.25)
 
 
 def address_of(selector: str) -> str:
-    return selector[len("address:"):] if selector.startswith("address:") else selector
+    return norm_address(selector)
 
 
 def scratchpad_state_path() -> str:
@@ -320,20 +321,27 @@ def save_scratchpad_state(state: dict) -> None:
         json.dump(state, handle, indent=2)
 
 
-def move_window(selector: str, workspace: str, attempts: int = 3) -> bool:
-    """Move a window and confirm the compositor actually did it; a dropped move is retried."""
+def move_window(selector: str, workspace: str, timeout: float = 30.0) -> bool:
+    """Move a window and confirm the compositor did it.
+
+    An early move is dropped when the app has not mapped its window yet, and slow starters (Qt, WebView)
+    can take tens of seconds, so this keeps re-dispatching and re-checking until the deadline instead
+    of trusting one call.
+    """
     address = address_of(selector)
-    if not wait_mapped(address):
-        print(f"window {address} never became mapped", file=sys.stderr)
-        return False
-    for _attempt in range(attempts):
-        dispatch(f'hl.dsp.window.move({{ window = "address:{address}", workspace = "{workspace}", follow = false }})')
-        deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline:
-            client = client_by_address(address)
-            if client and on_workspace(client, workspace):
-                return True
-            time.sleep(0.2)
+    deadline = time.monotonic() + timeout
+    last_dispatch = 0.0
+    while time.monotonic() < deadline:
+        client = client_by_address(address)
+        if client and on_workspace(client, workspace):
+            return True
+        now = time.monotonic()
+        if now - last_dispatch >= 1.0:
+            dispatch(
+                f'hl.dsp.window.move({{ window = "address:{address}", workspace = "{workspace}", follow = false }})'
+            )
+            last_dispatch = now
+        time.sleep(0.25)
     return False
 
 
@@ -382,12 +390,15 @@ def cmd_apply(args) -> int:
     if write_compiled(profile, active_mode, args.dry_run):
         print(f"compiled profile -> {compiled_file()}")
 
-    layout = SCROLLING if active_mode == "internal" else LAYOUT_REF
+    layout = workspace_layout_value(active_mode)
     for workspace in (profile.get("workspaces") or {}):
         if args.dry_run:
             print(f"[dry-run] ws {workspace}: workspace_rule layout={layout}")
         else:
             eval_lua(f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}" }})')
+    persisted = write_workspace_layouts(profile, active_mode, args.dry_run)
+    if persisted and not args.quiet:
+        print(f"persisted layout rules for {len(persisted)} workspace(s) in {os.path.dirname(persisted[0])}")
     if args.dry_run:
         for entry in profile.get("scratchpad") or []:
             print(f"[dry-run] launch {entry['exec']} -> special:scratchpad")
@@ -404,17 +415,31 @@ def cmd_apply(args) -> int:
 
     missing = {klass: spec for klass, spec in wanted.items() if klass not in live_classes}
 
+    # Profile windows that are already running on the wrong workspace are moved as well: the point of
+    # apply is that every base window ends up in the cell the profile gives it, whoever started it.
+    misplaced = []
+    for klass, spec in wanted.items():
+        for client in clients():
+            if (
+                client.get("class") == klass
+                and client.get("mapped")
+                and not on_workspace(client, spec["workspace"])
+            ):
+                misplaced.append((klass, "address:" + client["address"], spec["workspace"]))
+
     # Scratchpad entries are tracked by the address of the window this tool launched: their class is
     # shared with every other terminal (herdr runs inside ghostty), so class matching would both skip
     # the launch and, worse, adopt a window the user opened by hand.
     scratchpad_entries = profile.get("scratchpad") or []
     scratch_state = load_scratchpad_state()
-    live_addresses_set = {c["address"] for c in clients() if c.get("address")}
+    live_addresses_set = {norm_address(str(c.get("address") or "")) for c in clients() if c.get("address")}
     scratch_missing = [
-        entry for entry in scratchpad_entries if scratch_state.get(entry["app"]) not in live_addresses_set
+        entry
+        for entry in scratchpad_entries
+        if norm_address(str(scratch_state.get(entry["app"]) or "")) not in live_addresses_set
     ]
 
-    if not missing and not scratch_missing:
+    if not missing and not scratch_missing and not misplaced:
         print("all base windows already running; layout rules refreshed")
     for spec in missing.values():
         dispatch(f'hl.dsp.exec_cmd("{spec["leaf"]["exec"]}")')
@@ -422,6 +447,8 @@ def cmd_apply(args) -> int:
     for entry in scratch_missing:
         dispatch(f'hl.dsp.exec_cmd("{entry["exec"]}")')
         print(f"launching {entry['app']} ({entry['exec']}) -> special:scratchpad")
+    for klass, _, workspace in misplaced:
+        print(f"re-placing {klass} -> {workspace}")
 
     results: dict[str, str] = {}
     scratch_results: dict[str, str] = {}
@@ -447,17 +474,23 @@ def cmd_apply(args) -> int:
         if not selector:
             absent.append((klass, "did not open in time"))
             continue
-        if move_window(selector, spec["workspace"]):
+        if move_window(selector, spec["workspace"], timeout=args.timeout):
             placed.append((klass, spec["workspace"]))
         else:
             absent.append((klass, f"could not be moved to {spec['workspace']}"))
+
+    for klass, selector, workspace in misplaced:
+        if move_window(selector, workspace, timeout=args.timeout):
+            placed.append((klass, workspace))
+        else:
+            absent.append((klass, f"could not be moved to {workspace}"))
 
     for entry in scratch_missing:
         selector = scratch_results.get(entry["app"])
         if not selector:
             absent.append((entry["app"], "did not open in time"))
             continue
-        if move_window(selector, "special:scratchpad"):
+        if move_window(selector, "special:scratchpad", timeout=args.timeout):
             scratch_state[entry["app"]] = address_of(selector)
             placed.append((entry["app"], "special:scratchpad"))
         else:
@@ -478,6 +511,42 @@ def cmd_apply(args) -> int:
         handle.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
     log_line(f"apply mode={active_mode} placed={len(placed)} absent={len(absent)}", args.verbose)
     return 1 if absent else 0
+
+
+def workspace_layout_value(active_mode: str) -> str:
+    return SCROLLING if active_mode == "internal" else LAYOUT_REF
+
+
+def write_workspace_layouts(profile: dict, active_mode: str, dry_run: bool) -> list[str]:
+    """Persist the per-workspace layout rule the way Omarchy itself does.
+
+    `~/.local/state/omarchy/workspace-layouts/<ws>.lua` is loaded by
+    default/hypr/workspace-layouts.lua on every config load. Writing it here matters twice over:
+    those files survive a reload, and the files left behind by the retired omarchy-session tool
+    otherwise win the race and hand the workspace dwindle or scrolling instead of our layout.
+    """
+    layout = workspace_layout_value(active_mode)
+    directory = os.path.expanduser("~/.local/state/omarchy/workspace-layouts")
+    written = []
+    for workspace in profile.get("workspaces") or {}:
+        path = os.path.join(directory, f"{workspace}.lua")
+        text = (
+            "-- written by omarchy-layout - https://github.com/ivanvan08/omarchy-layout\n"
+            f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}" }})\n'
+        )
+        if os.path.exists(path):
+            with open(path) as handle:
+                if handle.read() == text:
+                    continue
+        written.append(path)
+        if dry_run:
+            continue
+        os.makedirs(directory, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    return written
 
 
 def report_geometry(profile: dict, active_mode: str, only_classes: set[str] | None = None, quiet=False) -> int:

@@ -6,7 +6,11 @@ import Quickshell.Io
 // Runs `omarchy-layout apply` exactly once per shell start. The CLI itself is
 // idempotent, but the shell start path is not: the first Hyprland raw event and
 // the fallback timer can both fire, so a guard keeps this to a single call.
-Service {
+//
+// The root type is Item, not Service: a file named Service.qml whose root is Service
+// inherits from itself and the shell refuses it ("Service is instantiated recursively").
+// First-party services are plain Items too (see plugins/services/battery/Service.qml).
+Item {
   id: root
 
   // Hyprland is up (first raw event seen, or the fallback timer elapsed).
