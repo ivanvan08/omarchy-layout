@@ -1,68 +1,98 @@
 # omarchy-layout
 
-Applies a saved window layout on an Omarchy (Hyprland 0.56, Lua config) desktop.
+Start and place your base windows at login on an Omarchy desktop (Hyprland 0.56, Lua config).
 
-Windows are tiled, never floated. The layout places each window into a cell
-defined by the profile: a leaf cell names an app, the tree of `split` /
-`children` nodes defines the columns and rows. On the internal laptop panel a
-scrolling layout with full-size windows is used instead, so windows keep a
-usable size on a small screen.
+Windows stay tiled, never floated. The profile describes a tree per workspace: a leaf names an app,
+`columns`/`rows` nodes split the work area. Hyprland hands each profiled workspace to a custom Lua
+layout, which places every window in the cell the tree gives it. On the internal laptop panel (no
+external output enabled) the profile switches those workspaces to Hyprland's built-in `scrolling`
+layout with full-size windows instead of pixel cells.
 
-Three parts:
+## Parts
 
-- `bin/layout` - the `omarchy-layout` CLI and layout engine.
-- `hypr/omarchy-layout.lua` - the Hyprland custom layout, registered as
-  `lua:omarchy-layout` and attached to workspaces via workspace rules.
-- `manifest.json` + `Service.qml` - a Quickshell service plugin that runs
-  `omarchy-layout apply` once at shell startup. They sit at the repo root so the
-  repo is itself a valid plugin and `omarchy plugin add` can install it.
+| Path | What it is |
+| :--- | :--- |
+| `bin/layout` | the `omarchy-layout` CLI and the engine: profile compilation, launching, placement, checks |
+| `hypr/omarchy-layout.lua` | the Hyprland custom layout, registered as `lua:omarchy-layout` |
+| `manifest.json`, `Service.qml` | a Quickshell service plugin that runs `omarchy-layout apply` once per shell start (repo root, so the repo is itself an installable plugin) |
+| `profiles/example.json` | neutral template; your own profile is `profiles/windows.json` (git-ignored) |
+| `tests/layout_spec.lua` | hermetic test of the placement rules, no session required |
+
+Requirements: Hyprland 0.55+ with the Lua config parser, Omarchy 4.x, Python 3.9+ (stdlib only).
+`lua5.4` is needed only to run the test.
 
 ## Install
 
-The plugin part is installed by the shell's own command, which clones the repo
-into `~/.config/omarchy/plugins/<id>/` and enables it:
+Two routes; both end with the same three artefacts in place.
+
+**From the shell's plugin manager** (clones the repo and enables it):
 
 ```sh
 omarchy plugin add https://github.com/ivanvan08/omarchy-layout --enable --yes
 ```
 
-From a local checkout, `./install.sh` does the same by symlinking: the repo is
-linked as `~/.config/omarchy/plugins/io.github.ivanvan08.layout`, `bin/layout`
-becomes `~/.local/bin/omarchy-layout`, `hypr/omarchy-layout.lua` becomes
-`~/.config/hypr/omarchy-layout.lua`, and the plugin is rescanned and enabled.
+**From a local checkout** (`./install.sh`), which symlinks instead of cloning:
 
-Either way it does not edit `~/.config/hypr/hyprland.lua`. Add this line
-yourself:
+| Link | Points at |
+| :--- | :--- |
+| `~/.config/omarchy/plugins/io.github.ivanvan08.layout` | the repo |
+| `~/.local/bin/omarchy-layout` | `bin/layout` |
+| `~/.config/hypr/omarchy-layout.lua` | `hypr/omarchy-layout.lua` |
+
+It also rescans the shell plugin list and runs `omarchy plugin enable io.github.ivanvan08.layout`.
+
+Then add one line to `~/.config/hypr/hyprland.lua`, next to the other `require`s:
 
 ```lua
 dofile((os.getenv("HOME") or "") .. "/.config/hypr/omarchy-layout.lua")
 ```
 
-`dofile` rather than `require`: Omarchy's `bootstrap.lua` prunes only the
-`default.hypr`, `hypr` and `omarchy.current.theme` module prefixes from
-`package.loaded` on a reload, so a `require`d module would be cached and would
-not re-register the layout after `hyprctl reload`. `dofile` re-runs the file
-every time, which is what keeps `lua:omarchy-layout` alive across reloads.
+`dofile` rather than `require` for two reasons: Omarchy's `bootstrap.lua` maps a dotted module name
+to a path (`require("hypr.x")` would look for `~/.config/hypr/hypr/x.lua`), and it prunes only the
+`default.hypr`, `hypr` and `omarchy.current.theme` prefixes from `package.loaded` on a reload, so a
+`require`d module would stay cached and never re-register the layout after `hyprctl reload`.
 
-**The plugin must be enabled or nothing runs at startup.** The shell mounts a
-third-party `service` only when its id is in the `plugins[]` array of
-`~/.config/omarchy/shell.json`; `omarchy-shell shell rescanPlugins` only rescans.
-`omarchy plugin enable io.github.ivanvan08.layout` writes that entry, and
-`omarchy plugin list --json` shows whether it took.
+Reload the compositor config once (`hyprctl reload`) and check that nothing else broke:
 
-## Profile format
+```sh
+hyprctl configerrors     # must print nothing
+```
 
-`profiles/windows.json` is the hand-edited source of truth. It is a tree per
-workspace:
+## Enable is not optional
+
+The shell mounts a third-party `service` plugin only when its id is listed in the `plugins[]` array
+of `~/.config/omarchy/shell.json`. `omarchy-shell shell rescanPlugins` only rescans; it does not
+enable. Verify with:
+
+```sh
+omarchy plugin list --json | jq '.[] | select(.id == "io.github.ivanvan08.layout")'
+```
+
+If the service fails to load, the shell says why:
+
+```sh
+journalctl --user --since "10 minutes ago" | grep "service plugin load failed"
+```
+
+## Profile
+
+`profiles/windows.json` is the hand-edited source of truth and is git-ignored, so a personal app set
+never lands in a public repository. Copy the template to start:
+
+```sh
+cp profiles/example.json profiles/windows.json
+```
+
+Schema:
 
 ```json
 {
   "version": 1,
   "scratchpad": [
-    { "app": "herdr", "class": "com.mitchellh.ghostty", "exec": "omarchy-launch-terminal herdr" }
+    { "app": "scratch", "class": "org.example.Terminal", "exec": "my-terminal --attach" }
   ],
   "workspaces": {
-    "1": { "app": "brave", "class": "brave-origin", "exec": "brave-origin" },
+    "1": { "app": "browser", "class": "org.example.Browser", "exec": "example-browser" },
     "2": {
       "split": "columns",
       "ratios": [0.5, 0.5],
@@ -71,93 +101,137 @@ workspace:
           "split": "columns",
           "ratios": [0.5, 0.5],
           "children": [
-            { "app": "signal", "class": "signal", "exec": "signal-desktop" },
-            { "app": "telegram", "class": "org.telegram.desktop", "exec": "Telegram" }
+            { "app": "chat-a", "class": "org.example.ChatA", "exec": "chat-a" },
+            { "app": "chat-b", "class": "org.example.ChatB", "exec": "chat-b" }
           ]
         },
-        { "app": "discord", "class": "discord", "exec": "discord" }
+        { "app": "editor", "class": "org.example.Editor", "exec": "editor" }
       ]
     }
   }
 }
 ```
 
-- Leaf: `app`, `class` (the value Hyprland reports for the window), `exec`.
-- Internal node: `split` (`"columns"` or `"rows"`), optional `ratios` (equal
-  shares when absent), and `children`.
-- Top level: `version`, optional `scratchpad` (list of leaves), `workspaces`.
-- Leaves are matched to live windows by `class`, in tree order; a leaf whose app
-  is not running keeps its cell empty. Windows that are not in the tree fill the
-  free cells, and once no cell is free the profile tree keeps the left half of
-  the work area.
-- `scratchpad` entries are tracked by the address of the window this tool
-  launched (`~/.local/state/omarchy/layout/scratchpad.json`), because herdr runs
-  inside ghostty and every terminal shares that class.
+- **Leaf**: `app` (label for reporting), `class` (the value Hyprland reports for the window, see
+  `hyprctl clients -j`), `exec` (shell command to start it).
+- **Internal node**: `split` (`"columns"` or `"rows"`), optional `ratios` (each share of the
+  remaining space, equal when omitted), `children` in left-to-right / top-to-bottom order.
+- **Top level**: `version`, optional `scratchpad` (list of leaves launched into the scratchpad and
+  revealed by the usual `SUPER + S`), `workspaces` (one tree per workspace number).
+
+Placement rules:
+
+- Leaves are matched to live windows by `class`, in tree order.
+- A leaf whose app is not running keeps its cell **reserved**: the other windows stay where the
+  profile puts them instead of stretching over the gap.
+- Windows that are not in the tree fill free cells first, then the right half of the work area, so an
+  extra window never overlaps a profiled one.
+- Ratios, not pixels: the compositor computes the pixel geometry from the work area, so the same
+  profile works on a different monitor or scaling.
+- `scratchpad` entries are tracked by the address of the window this tool launched (state file
+  `scratchpad.json`), not by class, because a terminal-running app shares its class with every other
+  terminal of the same emulator.
 
 ## CLI
 
 ```
-omarchy-layout apply                     # idempotent: launch missing windows, apply the layout
-omarchy-layout apply --dry-run           # print the plan and change nothing
-omarchy-layout plan                      # the same plan, read-only
-omarchy-layout status [--compare]        # profile vs live windows; --compare adds a rect diff
-omarchy-layout save [workspace]          # overwrite that workspace's node from the live session
-omarchy-layout list                      # one line per workspace
+omarchy-layout apply                # idempotent: launch what is missing, place everything
+omarchy-layout apply --dry-run      # print the plan, change nothing
+omarchy-layout apply --verbose      # log launches, placements and the geometry table
+omarchy-layout apply --timeout 90   # seconds to wait per window (default 45)
+omarchy-layout plan                 # the same plan, read-only
+omarchy-layout status               # each profile window: running or not, on which workspace
+omarchy-layout status --compare     # adds expected vs actual rects and the worst delta
+omarchy-layout save [workspace]     # overwrite that workspace's node from the live session
+omarchy-layout list                 # one line per workspace
 ```
 
-`save` reads the tiled windows of the given workspace (or the focused one),
-sorts them and writes them back as the workspace's tree with ratios derived from
-the live geometry - the fastest way to grow the profile from a session that
-already looks right.
+`apply` does three things, and only the first one launches anything:
 
-State lives in `~/.local/state/omarchy/layout/`: `profile.lua` (compiled from
-`profiles/windows.json`), `scratchpad.json`, a `last-apply` marker with an ISO
-timestamp written by every `apply`, and `log`.
+1. launches every profile window that is not running, targeting a workspace the window does not
+   choose by itself: it waits for the window's `openwindow` event on the Hyprland socket and moves it,
+2. re-places profile windows that are already running on the wrong workspace,
+3. compiles the profile and re-asserts the workspace rules, then reports the geometry diff.
+
+It exits non-zero when a window did not appear or could not be moved, so a wrapper or the service log
+can tell a clean run from a partial one.
+
+`save` reads the tiled windows of a workspace (the focused one by default), sorts them, writes them
+back as that workspace's tree with ratios derived from the live geometry, and always writes
+`profiles/windows.json`. It is the fastest way to grow a profile from a session that already looks
+right.
+
+Environment overrides:
+
+| Variable | Effect |
+| :--- | :--- |
+| `OMARCHY_LAYOUT_PROFILE` | profile file to read (default: `profiles/windows.json`, else `profiles/example.json`) |
+| `OMARCHY_LAYOUT_STATE` | state directory (default `~/.local/state/omarchy/layout`) |
+| `OMARCHY_LAYOUT_FAKE_MONITORS` | comma-separated monitor names, to test the internal-panel branch without unplugging anything |
+| `OMARCHY_LAYOUT_LAUNCH_TIMEOUT` | default for `--timeout` |
+
+State lives in `~/.local/state/omarchy/layout/`: `profile.lua` (compiled from the profile JSON),
+`scratchpad.json`, `last-apply` (ISO timestamp written by every run, including the automatic one) and
+`log` (one line per run).
 
 ## How it is wired to Hyprland
 
-The layout is registered once with `hl.layout.register(...)` under the name
-`lua:omarchy-layout`, then attached per workspace:
+The Lua module registers the layout and attaches it to the profiled workspaces:
 
 ```lua
+hl.layout.register("omarchy-layout", { recalculate = function(ctx) ... end })
 hl.workspace_rule({ workspace = N, layout = "lua:omarchy-layout" })
 ```
 
-Each workspace listed in the profile gets this rule, so Hyprland hands that
-workspace's tiling to the Lua layout.
+`recalculate` receives `ctx.area` (the work area) and `ctx.targets` (the workspace's tiled windows) and
+calls `target:place(ctx:split(box, side, ratio))` per window: Hyprland subtracts gaps and reserved
+space itself, so the module only deals in boxes.
+
+`apply` also writes the rule into `~/.local/state/omarchy/workspace-layouts/<workspace>.lua`, the file
+Omarchy loads on every config load. Both mechanisms are kept in sync because a rule registered at
+runtime does not move a workspace that already exists: the layout of a workspace is fixed when the
+workspace is created. Files left there by an older tool otherwise win and hand the workspace `dwindle`
+or `scrolling`.
+
+## Startup
+
+`Service.qml` waits for the first Hyprland raw event (or 5 s, whichever comes first), then runs
+`omarchy-layout apply` exactly once per shell start. The root type is `Item`, not `Service`: a file
+named `Service.qml` whose root is `Service` inherits from itself and the shell refuses it with
+`Service is instantiated recursively`. First-party services are plain `Item`s too
+(`plugins/services/battery/Service.qml`).
 
 ## Troubleshooting
 
-- Hyprland 0.55+ with the Lua config parser is required. The old
-  `hyprland.conf` keyword parser is not supported.
-- `hyprctl dispatch <name>` no longer works under the Lua parser: the argument
-  is wrapped as `hl.dispatch(<argument>)`, so a legacy dispatcher name is a Lua
-  syntax error and Hyprland shows an error overlay. The argument must be an
-  `hl.dsp.*` expression, as in Omarchy's own scripts:
+- **Nothing happens at login.** Check the three links exist, that `hyprctl configerrors` is empty, that
+  the plugin id is in `shell.json` `plugins[]`, and that `omarchy-layout apply` works when run by hand.
+- **`hyprctl dispatch <name>` does not work.** Under the Lua parser the argument is wrapped as
+  `hl.dispatch(<argument>)`, so a legacy dispatcher name is a syntax error and Hyprland shows an error
+  overlay. Pass an `hl.dsp.*` expression instead:
 
   ```sh
   hyprctl dispatch 'hl.dsp.window.move({ window = "address:0x...", workspace = "2", follow = false })'
-  # equivalent, explicit form:
-  hyprctl eval 'hl.dispatch(hl.dsp.window.move({ window = "address:0x...", workspace = "2" }))'
+  hyprctl eval 'hl.dispatch(hl.dsp.window.move({ window = "address:0x...", workspace = "2" }))'  # equivalent
   ```
 
-  Both return `ok` even when nothing happened, so a caller has to verify the
-  result (`hyprctl clients -j`) instead of trusting the reply. A move dispatched
-  immediately after the `openwindow` event is dropped: wait for the window to be
-  mapped first.
-- `hyprctl keyword` is a silent no-op under the Lua parser: it returns success
-  but changes nothing. Use `hyprctl eval` instead.
-- A workspace rule set with `hl.workspace_rule` while the compositor is running
-  does not always re-layout a workspace that already exists; the rule is
-  authoritative at config load, and `omarchy-layout apply` re-asserts it. The
-  layout name a workspace reports may lag behind the layout actually computing
-  the geometry - compare rects (`omarchy-layout status --compare`), not names.
-- Check state with:
-  - `hyprctl activeworkspace -j`
-  - `hyprctl clients -j`
-  - `~/.local/state/omarchy/layout/last-apply` (timestamp of the last apply)
-- The startup service logs to the shell console if `omarchy-layout` is not in
-  `PATH`, or if `apply` exits non-zero.
+- **A dispatched call returns `ok` but nothing happened.** Both forms above report `ok` even when the
+  call was a no-op. Verify the result (`hyprctl clients -j`) instead of trusting the reply.
+- **Window addresses differ between tools.** `.socket2.sock` prints them without the `0x` prefix,
+  `hyprctl clients -j` prints them with it. Compare normalised addresses.
+- **`hyprctl keyword` is a silent no-op** under the Lua parser: it returns success and changes
+  nothing.
+- **A workspace keeps its old layout.** Rules apply when the workspace is created; move its windows out
+  and back, or reload the config, to have it pick up the rule. The layout name a workspace reports
+  can lag behind the layout actually computing the geometry, so compare rects
+  (`omarchy-layout status --compare`), not names.
+- **Check state by hand:**
+
+  ```sh
+  hyprctl workspaces -j | jq -r '.[] | "\(.id) \(.tiledLayout)"'
+  hyprctl clients -j | jq -r '.[] | "\(.workspace.id) \(.class) \(.at) \(.size)"'
+  omarchy-layout status --compare
+  jq -R . ~/.local/state/omarchy/layout/last-apply
+  ```
 
 ## Optional: launcher menu entry
 
@@ -173,32 +247,34 @@ To re-apply the layout from the Omarchy menu, add this to
   },
 ```
 
-The parent is inferred from the dotted id, so `layout` becomes a root entry and
-`layout.apply` its child. The entry is optional - `omarchy-layout apply` works
-from any terminal or keybinding.
+The parent is inferred from the dotted id, so `layout` becomes a root entry and `layout.apply` its
+child.
 
 ## Tests
 
-The cell arithmetic is checked hermetically - no session, no compositor, no live state:
+The placement rules are checked hermetically: no session, no compositor, no live state, synthetic app
+names and an arbitrary work area.
 
 ```sh
 OMARCHY_LAYOUT_STATE=$(mktemp -d) lua5.4 tests/layout_spec.lua
 ```
 
 The test writes a fixture profile into that scratch directory, fakes `ctx.area`, `ctx.targets`,
-`ctx:split` and `target:place`, and asserts the cells for a nested workspace, a single-window
-workspace, a window outside the profile, an app that is not running, and the workspace rules the
-module registers.
+`ctx:split` and `target:place`, and asserts: every profile window is placed, cells are pairwise
+disjoint and inside the work area, the gaps between adjacent cells are exact, a missing app keeps its
+cell without shifting the others, a window outside the profile is placed to the right of the profile
+block without overlapping, an empty workspace is a no-op, a rule is registered per profile workspace,
+and in internal mode the workspaces fall back to `scrolling` with no cells placed.
 
 ## Uninstall
 
 ```sh
-./install.sh --uninstall
+./install.sh --uninstall          # removes the three symlinks and disables the plugin
 ```
 
-This removes the three symlinks. Then remove the `dofile(... omarchy-layout.lua)`
-line from `~/.config/hypr/hyprland.lua` and run
-`omarchy-shell shell rescanPlugins`.
+Then remove the `dofile(... omarchy-layout.lua)` line from `~/.config/hypr/hyprland.lua` and run
+`omarchy-shell shell rescanPlugins`. If you installed through `omarchy plugin add`, use
+`omarchy plugin disable io.github.ivanvan08.layout` followed by `omarchy plugin remove`.
 
 ## License
 

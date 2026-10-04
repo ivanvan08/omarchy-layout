@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "workspaces": {
+    "1": { "app": "browser", "class": "org.example.Browser", "exec": "example-browser" },
+    "2": {
+      "split": "columns",
+      "ratios": [0.5, 0.5],
+      "children": [
+        {
+          "split": "columns",
+          "ratios": [0.5, 0.5],
+          "children": [
+            { "app": "chat-a", "class": "org.example.ChatA", "exec": "chat-a" },
+            { "app": "chat-b", "class": "org.example.ChatB", "exec": "chat-b" }
+          ]
+        },
+        { "app": "editor", "class": "org.example.Editor", "exec": "editor" }
+      ]
+    },
+    "3": { "app": "files", "class": "org.example.Files", "exec": "files" }
+  }
+}

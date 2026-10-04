@@ -1,0 +1,3 @@
+# Your own window profile: keep it out of the public repo.
+# `omarchy-layout apply` prefers this file over profiles/example.json.
+profiles/windows.json

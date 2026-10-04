@@ -48,7 +48,21 @@ def repo_root() -> str:
 
 
 def profile_file() -> str:
-    return PROFILE_PATH or os.path.join(repo_root(), "profiles", "windows.json")
+    """Personal profile first, committed example second.
+
+    profiles/windows.json is git-ignored so a user's own app set never ends up in the public repo;
+    profiles/example.json is the template that ships with it.
+    """
+    if PROFILE_PATH:
+        return PROFILE_PATH
+    personal = personal_profile_file()
+    if os.path.exists(personal):
+        return personal
+    return os.path.join(repo_root(), "profiles", "example.json")
+
+
+def personal_profile_file() -> str:
+    return os.path.join(repo_root(), "profiles", "windows.json")
 
 
 def compiled_file() -> str:
@@ -428,8 +442,8 @@ def cmd_apply(args) -> int:
                 misplaced.append((klass, "address:" + client["address"], spec["workspace"]))
 
     # Scratchpad entries are tracked by the address of the window this tool launched: their class is
-    # shared with every other terminal (herdr runs inside ghostty), so class matching would both skip
-    # the launch and, worse, adopt a window the user opened by hand.
+    # shared with every other window of the same emulator, so class matching would both skip the
+    # launch and, worse, adopt a window the user opened by hand.
     scratchpad_entries = profile.get("scratchpad") or []
     scratch_state = load_scratchpad_state()
     live_addresses_set = {norm_address(str(c.get("address") or "")) for c in clients() if c.get("address")}
@@ -689,10 +703,11 @@ def cmd_save(args) -> int:
         node = {"split": "rows", "ratios": ratios, "children": children}
 
     profile.setdefault("workspaces", {})[workspace] = node
-    with open(profile_file(), "w") as handle:
+    with open(personal_profile_file(), "w") as handle:
         json.dump(profile, handle, indent=2)
         handle.write("\n")
     print(f"saved workspace {workspace} with {len(rects)} windows from the live session")
+    print(f"written to {personal_profile_file()}")
     for _client, box in rects:
         print(f"  {_client.get('class'):<26} {box}")
     return 0
