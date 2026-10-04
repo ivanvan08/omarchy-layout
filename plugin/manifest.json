@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ivanvan08.layout",
+  "name": "Window Layout",
+  "version": "1.0.0",
+  "author": "ivanvan08",
+  "description": "Applies the saved window layout once at shell startup",
+  "kinds": [
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

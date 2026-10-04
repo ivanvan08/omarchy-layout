@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""omarchy-layout - start and place the base windows of an Omarchy/Hyprland session.
+
+The profile (profiles/windows.json) is the hand-edited source of truth. `apply` compiles it to a
+Lua table that the Hyprland custom layout (`hypr/omarchy-layout.lua`, registered as
+`lua:omarchy-layout`) reads on every recalculation, then starts whatever base window is missing and
+moves it to its workspace. Windows stay tiled: the layout divides the work area into the cells the
+profile describes.
+
+On the internal laptop panel (no external output enabled) the profile is applied as Hyprland's
+built-in `scrolling` layout instead, with full-size windows.
+
+Everything that changes compositor state goes through `hyprctl eval` with an explicit
+`hl.dispatch(hl.dsp...)` call: under the Lua config parser `hyprctl dispatch <legacy-name>` is dead
+and `hyprctl keyword` is a silent no-op.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import socket
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.environ.get("OMARCHY_LAYOUT_STATE", os.path.expanduser("~/.local/state/omarchy/layout"))
+PROFILE_PATH = os.environ.get("OMARCHY_LAYOUT_PROFILE")
+SOCK_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "hypr")
+INSTANCE = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+LAYOUT_NAME = "omarchy-layout"
+LAYOUT_REF = "lua:" + LAYOUT_NAME
+SCROLLING = "scrolling"
+
+INTERNAL_RE = re.compile(r"^(eDP|LVDS|DSI)-")
+LAUNCH_TIMEOUT = float(os.environ.get("OMARCHY_LAYOUT_LAUNCH_TIMEOUT", "45"))
+GAP = 12
+BAR = 30
+
+
+# --------------------------------------------------------------------------- paths and state
+
+def repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def profile_file() -> str:
+    return PROFILE_PATH or os.path.join(repo_root(), "profiles", "windows.json")
+
+
+def compiled_file() -> str:
+    return os.path.join(STATE_DIR, "profile.lua")
+
+
+def load_profile() -> dict:
+    with open(profile_file()) as handle:
+        return json.load(handle)
+
+
+# --------------------------------------------------------------------------- hyprctl helpers
+
+def hyprctl(*args: str) -> str:
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True, check=False).stdout
+
+
+def hyprctl_json(*args: str):
+    out = hyprctl("-j", *args)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+def eval_lua(lua: str) -> bool:
+    """Config-level Lua in the compositor (`hl.workspace_rule`, `dofile`, ...), with the reply checked."""
+    result = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True, check=False)
+    reply = (result.stdout + result.stderr).strip()
+    if not reply.startswith("ok"):
+        print(f"eval failed: {lua} -> {reply}", file=sys.stderr)
+        return False
+    return True
+
+
+def dispatch(expr: str) -> bool:
+    """Fire an `hl.dsp.*` dispatcher.
+
+    Under the Lua config parser the old dispatcher-name syntax is gone: `hyprctl dispatch` wraps its
+    argument as `hl.dispatch(<argument>)`, so the argument must be an `hl.dsp.*` expression. This is
+    the form Omarchy's own scripts use. A reply other than `ok` means the call did nothing.
+    """
+    result = subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, text=True, check=False)
+    reply = (result.stdout + result.stderr).strip()
+    if not reply.startswith("ok"):
+        print(f"dispatch failed: {expr} -> {reply}", file=sys.stderr)
+        return False
+    return True
+
+
+def clients() -> list[dict]:
+    return hyprctl_json("clients") or []
+
+
+def client_by_address(address: str) -> dict | None:
+    for client in clients():
+        if client.get("address") == address:
+            return client
+    return None
+
+
+def on_workspace(client: dict, workspace: str) -> bool:
+    info = client.get("workspace") or {}
+    return str(info.get("id")) == str(workspace) or info.get("name") == workspace
+
+
+def wait_mapped(address: str, timeout: float = 10.0) -> bool:
+    """A move dispatched right after `openwindow` is dropped; wait until the window is mapped."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        client = client_by_address(address)
+        if client and client.get("mapped"):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+# --------------------------------------------------------------------------- profile traversal
+
+def leaves(node: dict) -> list[dict]:
+    if "class" in node:
+        return [node]
+    out: list[dict] = []
+    for child in node.get("children", []):
+        out.extend(leaves(child))
+    return out
+
+
+def workspace_leaves(profile: dict) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for workspace, node in (profile.get("workspaces") or {}).items():
+        out[str(workspace)] = leaves(node)
+    return out
+
+
+# --------------------------------------------------------------------------- monitor mode
+
+def enabled_monitors() -> list[str]:
+    fake = os.environ.get("OMARCHY_LAYOUT_FAKE_MONITORS")
+    if fake is not None:
+        return [name.strip() for name in fake.split(",") if name.strip()]
+    return [m["name"] for m in (hyprctl_json("monitors") or []) if not m.get("disabled")]
+
+
+def mode() -> str:
+    return "external" if any(not INTERNAL_RE.match(name) for name in enabled_monitors()) else "internal"
+
+
+# --------------------------------------------------------------------------- profile compilation
+
+def lua_value(value, indent: int = 0) -> str:
+    pad = "  " * indent
+    if isinstance(value, dict):
+        body = ",\n".join(
+            f'{pad}  ["{key}"] = {lua_value(val, indent + 1)}' for key, val in value.items() if val is not None
+        )
+        return "{\n" + body + ",\n" + pad + "}"
+    if isinstance(value, list):
+        body = ",\n".join(f"{pad}  {lua_value(item, indent + 1)}" for item in value)
+        return "{\n" + body + ",\n" + pad + "}"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
+def write_compiled(profile: dict, active_mode: str, dry_run: bool) -> bool:
+    compiled = {k: v for k, v in profile.items() if k in ("version", "workspaces", "scratchpad")}
+    compiled["mode"] = active_mode
+    text = "-- generated by omarchy-layout from profiles/windows.json; do not edit\n"
+    text += "return " + lua_value(compiled) + "\n"
+    path = compiled_file()
+    if os.path.exists(path):
+        with open(path) as handle:
+            if handle.read() == text:
+                return False
+    if dry_run:
+        print(f"[dry-run] would write {path}")
+        return True
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+    return True
+
+
+# --------------------------------------------------------------------------- expected geometry
+
+def expected_boxes(node: dict, box: tuple[int, int, int, int]) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """Approximate the compositor's split arithmetic, good to a few pixels; used for reporting."""
+    x, y, w, h = box
+    if "class" in node:
+        return [(node["class"], box)]
+
+    children = node.get("children") or []
+    ratios = node.get("ratios") or []
+    count = len(children)
+    out: list[tuple[str, tuple[int, int, int, int]]] = []
+    vertical = node.get("split") == "rows"
+    rest = box
+    for i, child in enumerate(children):
+        rx, ry, rw, rh = rest
+        if i == count - 1:
+            part = rest
+            rest = None
+        else:
+            fraction = ratios[i] if i < len(ratios) else 1 / (count - i)
+            if vertical:
+                ph = int(round(fraction * (rh + GAP))) - GAP
+                part = (rx, ry, rw, ph)
+                rest = (rx, ry + ph + GAP, rw, rh - ph - GAP)
+            else:
+                pw = int(round(fraction * (rw + GAP))) - GAP
+                part = (rx, ry, pw, rh)
+                rest = (rx + pw + GAP, ry, rw - pw - GAP, rh)
+        out.extend(expected_boxes(child, part))
+    return out
+
+
+def work_area() -> tuple[int, int, int, int]:
+    monitors = enabled_monitors()
+    data = hyprctl_json("monitors") or []
+    external = [m for m in data if m.get("name") in monitors and not m.get("disabled")]
+    if not external:
+        return (GAP, BAR + GAP, 3200 - 2 * GAP, 900 - BAR - 2 * GAP)
+    monitor = external[0]
+    scale = monitor.get("scale") or 1
+    width = int(monitor["width"] / scale)
+    height = int(monitor["height"] / scale)
+    # hyprctl reports reserved as left, top, right, bottom (the bar occupies the top).
+    left, top, right, bottom = (monitor.get("reserved") or [0, 0, 0, 0])[:4]
+    return (GAP + left, top + GAP, width - 2 * GAP - left - right, height - 2 * GAP - top - bottom)
+
+
+# --------------------------------------------------------------------------- launching
+
+def socket_path() -> str:
+    return os.path.join(SOCK_DIR, INSTANCE, ".socket2.sock")
+
+
+def watch_openwindows(deadline: float, log):
+    """Yield (selector, class) for every openwindow event until the deadline; no polling, no sleeps."""
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.connect(socket_path())
+    except OSError as error:
+        log(f"cannot watch hyprland events ({error}); falling back to polling")
+        yield from poll_openwindows(deadline)
+        return
+
+    buffer = b""
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            ready, _, _ = select.select([conn], [], [], left)
+            if not ready:
+                return
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                text = line.decode("utf-8", "replace")
+                if not text.startswith("openwindow>>"):
+                    continue
+                parts = text[len("openwindow>>"):].split(",")
+                if len(parts) >= 3:
+                    yield "address:" + parts[0], parts[2]
+    finally:
+        conn.close()
+
+
+def poll_openwindows(deadline: float):
+    seen: set[str] = set()
+    while time.monotonic() < deadline:
+        for client in clients():
+            address = client.get("address")
+            if address and address not in seen and (client.get("mapped") or 0):
+                seen.add(address)
+                yield "address:" + address, client.get("class")
+        time.sleep(0.25)
+
+
+def address_of(selector: str) -> str:
+    return selector[len("address:"):] if selector.startswith("address:") else selector
+
+
+def scratchpad_state_path() -> str:
+    return os.path.join(STATE_DIR, "scratchpad.json")
+
+
+def load_scratchpad_state() -> dict:
+    try:
+        with open(scratchpad_state_path()) as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_scratchpad_state(state: dict) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(scratchpad_state_path(), "w") as handle:
+        json.dump(state, handle, indent=2)
+
+
+def move_window(selector: str, workspace: str, attempts: int = 3) -> bool:
+    """Move a window and confirm the compositor actually did it; a dropped move is retried."""
+    address = address_of(selector)
+    if not wait_mapped(address):
+        print(f"window {address} never became mapped", file=sys.stderr)
+        return False
+    for _attempt in range(attempts):
+        dispatch(f'hl.dsp.window.move({{ window = "address:{address}", workspace = "{workspace}", follow = false }})')
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            client = client_by_address(address)
+            if client and on_workspace(client, workspace):
+                return True
+            time.sleep(0.2)
+    return False
+
+
+# --------------------------------------------------------------------------- commands
+
+def log_line(message: str, verbose: bool) -> None:
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    line = f"{stamp} {message}"
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "log"), "a") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+    if verbose:
+        print(line)
+
+
+def cmd_plan(args) -> int:
+    profile = load_profile()
+    active_mode = mode()
+    print(f"profile : {profile_file()}")
+    print(f"mode    : {active_mode}  (monitors: {', '.join(enabled_monitors()) or 'none'})")
+    if active_mode == "internal":
+        print("layout  : scrolling (full-size windows), no pixel geometry")
+        for workspace in (profile.get("workspaces") or {}):
+            print(f"  ws {workspace}: {', '.join(leaf['class'] for leaf in leaves(profile['workspaces'][workspace]))}")
+        return 0
+    area = work_area()
+    print(f"layout  : {LAYOUT_REF}   work area {area} (approximate)")
+    for workspace, leaves_ in sorted(workspace_leaves(profile).items(), key=lambda kv: float(kv[0])):
+        node = profile["workspaces"][workspace]
+        print(f"  ws {workspace}:")
+        for klass, box in expected_boxes(node, area):
+            print(f"    {klass:<28} {box}")
+    for entry in profile.get("scratchpad") or []:
+        print(f"  scratchpad: {entry['app']} ({entry['class']}) <- {entry['exec']}")
+    return 0
+
+
+def cmd_apply(args) -> int:
+    profile = load_profile()
+    active_mode = mode()
+    if not args.quiet:
+        print(f"omarchy-layout apply: mode={active_mode} profile={profile_file()}")
+    if write_compiled(profile, active_mode, args.dry_run):
+        print(f"compiled profile -> {compiled_file()}")
+
+    layout = SCROLLING if active_mode == "internal" else LAYOUT_REF
+    for workspace in (profile.get("workspaces") or {}):
+        if args.dry_run:
+            print(f"[dry-run] ws {workspace}: workspace_rule layout={layout}")
+        else:
+            eval_lua(f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}" }})')
+    if args.dry_run:
+        for entry in profile.get("scratchpad") or []:
+            print(f"[dry-run] launch {entry['exec']} -> special:scratchpad")
+        for workspace, leaves_ in workspace_leaves(profile).items():
+            for leaf in leaves_:
+                print(f"[dry-run] ensure {leaf['class']} on ws {workspace} ({leaf['exec']})")
+        return 0
+
+    live_classes = {client.get("class") for client in clients()}
+    wanted: dict[str, dict] = {}
+    for workspace, leaves_ in workspace_leaves(profile).items():
+        for leaf in leaves_:
+            wanted.setdefault(leaf["class"], {"leaf": leaf, "workspace": workspace})
+
+    missing = {klass: spec for klass, spec in wanted.items() if klass not in live_classes}
+
+    # Scratchpad entries are tracked by the address of the window this tool launched: their class is
+    # shared with every other terminal (herdr runs inside ghostty), so class matching would both skip
+    # the launch and, worse, adopt a window the user opened by hand.
+    scratchpad_entries = profile.get("scratchpad") or []
+    scratch_state = load_scratchpad_state()
+    live_addresses_set = {c["address"] for c in clients() if c.get("address")}
+    scratch_missing = [
+        entry for entry in scratchpad_entries if scratch_state.get(entry["app"]) not in live_addresses_set
+    ]
+
+    if not missing and not scratch_missing:
+        print("all base windows already running; layout rules refreshed")
+    for spec in missing.values():
+        dispatch(f'hl.dsp.exec_cmd("{spec["leaf"]["exec"]}")')
+        print(f"launching {spec['leaf']['app']} ({spec['leaf']['exec']}) -> {spec['workspace']}")
+    for entry in scratch_missing:
+        dispatch(f'hl.dsp.exec_cmd("{entry["exec"]}")')
+        print(f"launching {entry['app']} ({entry['exec']}) -> special:scratchpad")
+
+    results: dict[str, str] = {}
+    scratch_results: dict[str, str] = {}
+    pending = set(missing)
+    pending_scratch = {entry["app"]: entry for entry in scratch_missing}
+    if pending or pending_scratch:
+        deadline = time.monotonic() + args.timeout
+        for selector, klass in watch_openwindows(deadline, lambda message: log_line(message, args.verbose)):
+            if klass in pending:
+                results[klass] = selector
+                pending.discard(klass)
+            for app, entry in list(pending_scratch.items()):
+                if entry["class"] == klass and address_of(selector) not in live_addresses_set:
+                    scratch_results[app] = selector
+                    live_addresses_set.add(address_of(selector))
+                    pending_scratch.pop(app, None)
+            if not pending and not pending_scratch:
+                break
+
+    placed, absent = [], []
+    for klass, spec in missing.items():
+        selector = results.get(klass)
+        if not selector:
+            absent.append((klass, "did not open in time"))
+            continue
+        if move_window(selector, spec["workspace"]):
+            placed.append((klass, spec["workspace"]))
+        else:
+            absent.append((klass, f"could not be moved to {spec['workspace']}"))
+
+    for entry in scratch_missing:
+        selector = scratch_results.get(entry["app"])
+        if not selector:
+            absent.append((entry["app"], "did not open in time"))
+            continue
+        if move_window(selector, "special:scratchpad"):
+            scratch_state[entry["app"]] = address_of(selector)
+            placed.append((entry["app"], "special:scratchpad"))
+        else:
+            absent.append((entry["app"], "could not be moved to the scratchpad"))
+    if scratch_missing:
+        save_scratchpad_state(scratch_state)
+
+    time.sleep(args.settle)
+    report_geometry(profile, active_mode, only_classes={klass for klass, _ in placed})
+
+    for name, workspace in placed:
+        print(f"placed {name} -> {workspace}")
+    for name, reason in absent:
+        print(f"WARNING: {name}: {reason}")
+
+    marker = os.path.join(STATE_DIR, "last-apply")
+    with open(marker, "w") as handle:
+        handle.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+    log_line(f"apply mode={active_mode} placed={len(placed)} absent={len(absent)}", args.verbose)
+    return 1 if absent else 0
+
+
+def report_geometry(profile: dict, active_mode: str, only_classes: set[str] | None = None, quiet=False) -> int:
+    if active_mode == "internal":
+        return 0
+    area = work_area()
+    live = clients()
+    worst = 0
+    for workspace, node in sorted((profile.get("workspaces") or {}).items(), key=lambda kv: float(kv[0])):
+        for klass, (ex, ey, ew, eh) in expected_boxes(node, area):
+            if only_classes and klass not in only_classes:
+                continue
+            client = next(
+                (c for c in live if c.get("class") == klass and str(c["workspace"]["id"]) == str(workspace)),
+                None,
+            )
+            if not client:
+                if not quiet:
+                    print(f"  ws {workspace} {klass:<26} MISSING")
+                worst = 10 ** 6
+                continue
+            ax, ay = client["at"]
+            aw, ah = client["size"]
+            delta = max(abs(ax - ex), abs(ay - ey), abs(aw - ew), abs(ah - eh))
+            worst = max(worst, delta)
+            if not quiet:
+                flag = "ok" if delta <= 4 else "OFF"
+                print(f"  ws {workspace} {klass:<26} expected {ex},{ey} {ew}x{eh}  actual {ax},{ay} {aw}x{ah}  max {delta:>4}px {flag}")
+    return worst
+
+
+def cmd_status(args) -> int:
+    profile = load_profile()
+    active_mode = mode()
+    print(f"mode {active_mode}   compiled {compiled_file()} ("
+          f"{'present' if os.path.exists(compiled_file()) else 'absent'})")
+    marker = os.path.join(STATE_DIR, "last-apply")
+    if os.path.exists(marker):
+        with open(marker) as handle:
+            print(f"last apply {handle.read().strip()}")
+    live = clients()
+    by_class: dict[str, dict] = {}
+    for client in live:
+        by_class.setdefault(client.get("class"), client)
+    for workspace, leaves_ in sorted(workspace_leaves(profile).items(), key=lambda kv: float(kv[0])):
+        for leaf in leaves_:
+            client = by_class.get(leaf["class"])
+            if client:
+                wx = client["workspace"]["id"]
+                print(f"  ws {workspace} {leaf['app']:<12} {leaf['class']:<26} running on ws {wx}")
+            else:
+                print(f"  ws {workspace} {leaf['app']:<12} {leaf['class']:<26} not running")
+    for entry in profile.get("scratchpad") or []:
+        print(f"  scratchpad {entry['app']:<12} {entry['class']:<26} "
+              f"{'running' if entry['class'] in by_class else 'not running'}")
+    for workspace in (profile.get("workspaces") or {}):
+        data = hyprctl_json("workspaces") or []
+        for workspace_info in data:
+            if str(workspace_info["id"]) == str(workspace):
+                print(f"  ws {workspace} tiledLayout={workspace_info.get('tiledLayout')}")
+    if args.compare:
+        print("geometry:")
+        worst = report_geometry(profile, active_mode)
+        print(f"worst delta {worst}px")
+    return 0
+
+
+def guess_exec(klass: str) -> str:
+    roots = ["/usr/share/applications", os.path.expanduser("~/.local/share/applications")]
+    for root in roots:
+        for name in os.listdir(root) if os.path.isdir(root) else []:
+            if not name.endswith(".desktop"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path) as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            wm_class = re.search(r"^StartupWMClass=(.*)$", text, re.M)
+            exec_line = re.search(r"^Exec=(.*)$", text, re.M)
+            if wm_class and exec_line and wm_class.group(1).strip() == klass:
+                return exec_line.group(1).split(" %")[0].strip()
+    return klass.lower()
+
+
+def build_saved_node(rects: list[tuple[dict, tuple[int, int, int, int]]], horizontal: bool = True) -> dict:
+    if len(rects) == 1:
+        client = rects[0][0]
+        return {"app": client.get("class"), "class": client.get("class"), "exec": guess_exec(client.get("class", ""))}
+
+    key_index = 0 if horizontal else 1
+    spans = [rect[1][key_index] for rect in rects]
+    extents = [rect[1][key_index] + rect[1][2 + key_index] for rect in rects]
+    total = max(extents) - min(spans)
+    ratios = [round((extents[i] - spans[i]) / total, 4) for i in range(len(rects))]
+    return {
+        "split": "columns" if horizontal else "rows",
+        "ratios": ratios,
+        "children": [build_saved_node([rect]) for rect in rects],
+    }
+
+
+def cmd_save(args) -> int:
+    profile = load_profile()
+    if args.workspace:
+        workspace = str(args.workspace)
+    else:
+        active = hyprctl_json("activeworkspace") or {}
+        workspace = str(active.get("id", "1"))
+    rects = []
+    for client in clients():
+        if str(client["workspace"]["id"]) != workspace:
+            continue
+        if not (client.get("mapped") or 0) or client.get("floating"):
+            continue
+        x, y = client["at"]
+        w, h = client["size"]
+        rects.append((client, (x, y, w, h)))
+    if not rects:
+        print(f"no tiled windows on workspace {workspace}")
+        return 1
+    rects.sort(key=lambda item: (item[1][1], item[1][0]))
+
+    bands: dict[tuple[int, int], list] = {}
+    for item in rects:
+        bands.setdefault((item[1][1], item[1][3]), []).append(item)
+    band_keys = sorted(bands)
+    if len(band_keys) == 1:
+        node = build_saved_node(list(rects))
+    else:
+        heights = [band[1] for band in bands.values()]
+        total = max(b[1][1] + b[1][3] for b in bands.values()) - min(b[1][1] for b in bands.values())
+        children = []
+        ratios = []
+        for key in band_keys:
+            band = sorted(bands[key], key=lambda item: item[1][0])
+            children.append(build_saved_node(band) if len(band) > 1 else build_saved_node([band[0]]))
+            ratios.append(round(heights[band_keys.index(key)] / total, 4))
+        node = {"split": "rows", "ratios": ratios, "children": children}
+
+    profile.setdefault("workspaces", {})[workspace] = node
+    with open(profile_file(), "w") as handle:
+        json.dump(profile, handle, indent=2)
+        handle.write("\n")
+    print(f"saved workspace {workspace} with {len(rects)} windows from the live session")
+    for _client, box in rects:
+        print(f"  {_client.get('class'):<26} {box}")
+    return 0
+
+
+def cmd_list(args) -> int:
+    profile = load_profile()
+    for workspace, leaves_ in sorted(workspace_leaves(profile).items(), key=lambda kv: float(kv[0])):
+        print(f"ws {workspace}: " + ", ".join(f"{leaf['app']}({leaf['class']})" for leaf in leaves_))
+    for entry in profile.get("scratchpad") or []:
+        print(f"scratchpad: {entry['app']}({entry['class']})")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="omarchy-layout", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    apply_parser = sub.add_parser("apply", help="compile the profile and start/place missing base windows")
+    apply_parser.add_argument("--dry-run", action="store_true")
+    apply_parser.add_argument("--timeout", type=float, default=LAUNCH_TIMEOUT)
+    apply_parser.add_argument("--settle", type=float, default=1.5)
+    apply_parser.add_argument("--verbose", action="store_true")
+    apply_parser.add_argument("--quiet", action="store_true")
+
+    sub.add_parser("plan", help="print what apply would do, without touching anything")
+    status_parser = sub.add_parser("status", help="profile vs live windows")
+    status_parser.add_argument("--compare", action="store_true", help="compare rects against the profile cells")
+    save_parser = sub.add_parser("save", help="overwrite a workspace node from the live session")
+    save_parser.add_argument("workspace", nargs="?", help="workspace id (default: the focused one)")
+    sub.add_parser("list", help="one line per workspace")
+
+    args = parser.parse_args(argv)
+    return {
+        "apply": cmd_apply,
+        "plan": cmd_plan,
+        "status": cmd_status,
+        "save": cmd_save,
+        "list": cmd_list,
+    }[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
