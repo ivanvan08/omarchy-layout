@@ -85,3 +85,7 @@ echo
 echo "Done. One manual step remains:"
 echo "  Add this line to ~/.config/hypr/hyprland.lua:"
 echo "    dofile((os.getenv(\"HOME\") or \"\") .. \"/.config/hypr/omarchy-layout.lua\")"
+echo
+echo "Optional launcher entry: add to ~/.config/omarchy/extensions/omarchy-menu.jsonc"
+echo "  \"layout\": { \"label\": \"Window layout\" },"
+echo "  \"layout.apply\": { \"label\": \"Re-apply base windows\", \"action\": \"omarchy-layout apply\" },"

@@ -159,6 +159,24 @@ workspace's tiling to the Lua layout.
 - The startup service logs to the shell console if `omarchy-layout` is not in
   `PATH`, or if `apply` exits non-zero.
 
+## Optional: launcher menu entry
+
+To re-apply the layout from the Omarchy menu, add this to
+`~/.config/omarchy/extensions/omarchy-menu.jsonc` (it hot-reloads on save):
+
+```jsonc
+  "layout": { "label": "Window layout" },
+  "layout.apply": {
+    "label": "Re-apply base windows",
+    "action": "omarchy-layout apply",
+    "description": "Start and place the profile's base windows"
+  },
+```
+
+The parent is inferred from the dotted id, so `layout` becomes a root entry and
+`layout.apply` its child. The entry is optional - `omarchy-layout apply` works
+from any terminal or keybinding.
+
 ## Tests
 
 The cell arithmetic is checked hermetically - no session, no compositor, no live state:
