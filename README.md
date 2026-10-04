@@ -8,22 +8,31 @@ defined by the profile: a leaf cell names an app, the tree of `split` /
 scrolling layout with full-size windows is used instead, so windows keep a
 usable size on a small screen.
 
-Two parts:
+Three parts:
 
 - `bin/layout` - the `omarchy-layout` CLI and layout engine.
 - `hypr/omarchy-layout.lua` - the Hyprland custom layout, registered as
   `lua:omarchy-layout` and attached to workspaces via workspace rules.
-- `plugin/` - a Quickshell service that runs `omarchy-layout apply` once at
-  shell startup.
+- `manifest.json` + `Service.qml` - a Quickshell service plugin that runs
+  `omarchy-layout apply` once at shell startup. They sit at the repo root so the
+  repo is itself a valid plugin and `omarchy plugin add` can install it.
 
 ## Install
 
+The plugin part is installed by the shell's own command, which clones the repo
+into `~/.config/omarchy/plugins/<id>/` and enables it:
+
 ```sh
-./install.sh
+omarchy plugin add https://github.com/ivanvan08/omarchy-layout --enable --yes
 ```
 
-This symlinks the plugin, the CLI, and the Hyprland layout into your config. It
-does not edit `~/.config/hypr/hyprland.lua`. Add this line yourself:
+From a local checkout, `./install.sh` does the same by symlinking: the repo is
+linked as `~/.config/omarchy/plugins/io.github.ivanvan08.layout`, `bin/layout`
+becomes `~/.local/bin/omarchy-layout`, `hypr/omarchy-layout.lua` becomes
+`~/.config/hypr/omarchy-layout.lua`, and the plugin is rescanned and enabled.
+
+Either way it does not edit `~/.config/hypr/hyprland.lua`. Add this line
+yourself:
 
 ```lua
 dofile((os.getenv("HOME") or "") .. "/.config/hypr/omarchy-layout.lua")
@@ -35,11 +44,11 @@ dofile((os.getenv("HOME") or "") .. "/.config/hypr/omarchy-layout.lua")
 not re-register the layout after `hyprctl reload`. `dofile` re-runs the file
 every time, which is what keeps `lua:omarchy-layout` alive across reloads.
 
-Then reload the plugin:
-
-```sh
-omarchy-shell shell rescanPlugins
-```
+**The plugin must be enabled or nothing runs at startup.** The shell mounts a
+third-party `service` only when its id is in the `plugins[]` array of
+`~/.config/omarchy/shell.json`; `omarchy-shell shell rescanPlugins` only rescans.
+`omarchy plugin enable io.github.ivanvan08.layout` writes that entry, and
+`omarchy plugin list --json` shows whether it took.
 
 ## Profile format
 
