@@ -57,7 +57,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   unlink "$CLI_DST"
   unlink "$HYPR_DST"
   echo
-  echo "Done. Remove require(\"hypr.omarchy-layout\") from ~/.config/hypr/hyprland.lua,"
+  echo "Done. Remove the omarchy-layout dofile line from ~/.config/hypr/hyprland.lua,"
   echo "then run: omarchy-shell shell rescanPlugins"
   exit 0
 fi
@@ -69,5 +69,5 @@ link "$HYPR_SRC" "$HYPR_DST"
 echo
 echo "Done. Two manual steps remain:"
 echo "  1. Add this line to ~/.config/hypr/hyprland.lua:"
-echo "       require(\"hypr.omarchy-layout\")"
+echo "       dofile((os.getenv(\"HOME\") or \"\") .. \"/.config/hypr/omarchy-layout.lua\")"
 echo "  2. Reload the plugin: omarchy-shell shell rescanPlugins"

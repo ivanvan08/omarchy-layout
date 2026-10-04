@@ -169,7 +169,9 @@ local function recalculate(ctx)
   place_leftovers(ctx, ctx.targets, free)
 end
 
-hl.layout.register(LAYOUT_NAME, { recalculate = recalculate })
+-- Guarded: a config reload re-runs this file, and a duplicate registration must not surface as an
+-- error overlay. Registration is by name, so re-running it is harmless.
+pcall(hl.layout.register, LAYOUT_NAME, { recalculate = recalculate })
 
 -- Wire the workspaces named by the profile so that a config reload is enough after an apply.
 local profile = load_profile()

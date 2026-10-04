@@ -26,8 +26,14 @@ This symlinks the plugin, the CLI, and the Hyprland layout into your config. It
 does not edit `~/.config/hypr/hyprland.lua`. Add this line yourself:
 
 ```lua
-require("hypr.omarchy-layout")
+dofile((os.getenv("HOME") or "") .. "/.config/hypr/omarchy-layout.lua")
 ```
+
+`dofile` rather than `require`: Omarchy's `bootstrap.lua` prunes only the
+`default.hypr`, `hypr` and `omarchy.current.theme` module prefixes from
+`package.loaded` on a reload, so a `require`d module would be cached and would
+not re-register the layout after `hyprctl reload`. `dofile` re-runs the file
+every time, which is what keeps `lua:omarchy-layout` alive across reloads.
 
 Then reload the plugin:
 
@@ -144,14 +150,27 @@ workspace's tiling to the Lua layout.
 - The startup service logs to the shell console if `omarchy-layout` is not in
   `PATH`, or if `apply` exits non-zero.
 
+## Tests
+
+The cell arithmetic is checked hermetically - no session, no compositor, no live state:
+
+```sh
+OMARCHY_LAYOUT_STATE=$(mktemp -d) lua5.4 tests/layout_spec.lua
+```
+
+The test writes a fixture profile into that scratch directory, fakes `ctx.area`, `ctx.targets`,
+`ctx:split` and `target:place`, and asserts the cells for a nested workspace, a single-window
+workspace, a window outside the profile, an app that is not running, and the workspace rules the
+module registers.
+
 ## Uninstall
 
 ```sh
 ./install.sh --uninstall
 ```
 
-This removes the three symlinks. Then remove
-`require("hypr.omarchy-layout")` from `~/.config/hypr/hyprland.lua` and run
+This removes the three symlinks. Then remove the `dofile(... omarchy-layout.lua)`
+line from `~/.config/hypr/hyprland.lua` and run
 `omarchy-shell shell rescanPlugins`.
 
 ## License
