@@ -100,6 +100,35 @@ local function split(box, side, ratio)
   return { x = x, y = y + part + GAP, w = w, h = h - part - GAP }
 end
 
+-- The real targets are read-only host objects: writing a field to one raises
+-- "attempt to modify read-only hl object". The fakes enforce the same rule, so any assignment the
+-- layout makes to a host object fails the test instead of only spamming the compositor log.
+local function make_target(klass, workspace, on_place)
+  local window = { class = klass, workspace = { id = workspace } }
+  setmetatable(window, {
+    __newindex = function()
+      error("attempt to modify read-only hl object", 2)
+    end,
+  })
+
+  local target = {}
+  setmetatable(target, {
+    __index = function(_, key)
+      if key == "place" then
+        return on_place
+      end
+      if key == "window" then
+        return window
+      end
+      return nil
+    end,
+    __newindex = function()
+      error("attempt to modify read-only hl object", 2)
+    end,
+  })
+  return target
+end
+
 local function run(classes, workspace)
   local placed = {}
   local ctx = { area = AREA, targets = {} }
@@ -107,12 +136,9 @@ local function run(classes, workspace)
     return split(box, side, ratio)
   end
   for _, klass in ipairs(classes) do
-    ctx.targets[#ctx.targets + 1] = {
-      window = { class = klass, workspace = { id = workspace } },
-      place = function(_, box)
-        placed[klass] = box
-      end,
-    }
+    ctx.targets[#ctx.targets + 1] = make_target(klass, workspace, function(_, box)
+      placed[klass] = box
+    end)
   end
   registered.recalculate(ctx)
   return placed
@@ -185,8 +211,9 @@ check("a missing app keeps its cell free",
 check("a missing app does not shift the others",
   partial[classes[3]].x == editor.x and partial[classes[3]].w == editor.w, fmt(partial[classes[3]]))
 
-local extra = run({ classes[1], classes[2], classes[3], "org.example.Other" }, 2)
-local other = extra["org.example.Other"]
+local ok_extra, extra = pcall(run, { classes[1], classes[2], classes[3], "org.example.Other" }, 2)
+check("the layout writes nothing to host objects", ok_extra, tostring(extra))
+local other = extra and extra["org.example.Other"]
 print("window outside the profile: " .. (fmt(other) or "NOT PLACED"))
 check("a window outside the profile is placed", other ~= nil)
 check("nothing overlaps the outside window", pairwise_disjoint({

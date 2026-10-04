@@ -89,10 +89,10 @@ local function workspace_of(ctx)
   return nil
 end
 
-local function place_leftovers(ctx, targets, free)
+local function place_leftovers(ctx, placed, free)
   local pending = {}
-  for _, target in ipairs(targets) do
-    if not target.placed and target.window then
+  for _, target in ipairs(ctx.targets) do
+    if not placed[target] and target.window then
       pending[#pending + 1] = target
     end
   end
@@ -163,10 +163,9 @@ local function recalculate(ctx)
     free[#free + 1] = right
   end
 
-  for _, target in ipairs(ctx.targets) do
-    target.placed = used[target] == true
-  end
-  place_leftovers(ctx, ctx.targets, free)
+  -- Never write to `target`: the objects in ctx.targets are read-only host objects and assigning a
+  -- field to them raises "attempt to modify read-only hl object".
+  place_leftovers(ctx, used, free)
 end
 
 -- Guarded: a config reload re-runs this file, and a duplicate registration must not surface as an
