@@ -135,5 +135,39 @@ check("rules registered", tostring(#rules), "2")
 check("rule ws 1", layouts["1"], "lua:omarchy-layout")
 check("rule ws 2", layouts["2"], "lua:omarchy-layout")
 
+-- Internal panel: the profile must switch the workspaces to the built-in scrolling layout and leave
+-- the geometry to the compositor instead of placing cells.
+local internal_fixture = [[
+return {
+  ["version"] = 1,
+  ["mode"] = "internal",
+  ["workspaces"] = {
+    ["1"] = { ["app"] = "brave", ["class"] = "brave-origin" },
+    ["2"] = {
+      ["split"] = "rows",
+      ["children"] = {
+        { ["app"] = "signal", ["class"] = "signal" },
+        { ["app"] = "discord", ["class"] = "discord" },
+      },
+    },
+  },
+}
+]]
+local handle2 = assert(io.open(state_dir .. "/profile.lua", "w"))
+handle2:write(internal_fixture)
+handle2:close()
+
+rules = {}
+registered = nil
+dofile(module_path)
+
+local internal_layouts = {}
+for _, rule in ipairs(rules) do
+  internal_layouts[tostring(rule.workspace)] = rule.layout
+end
+check("internal: rule ws 1", internal_layouts["1"], "scrolling")
+check("internal: rule ws 2", internal_layouts["2"], "scrolling")
+check("internal: no cells placed", tostring(next(run({ "signal", "discord" }, 2))), "nil")
+
 print(fails == 0 and "ALL PASS" or (fails .. " FAILURES"))
 os.exit(fails == 0 and 0 or 1)
