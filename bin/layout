@@ -267,8 +267,12 @@ def socket_path() -> str:
     return os.path.join(SOCK_DIR, INSTANCE, ".socket2.sock")
 
 
-def watch_openwindows(deadline: float, log):
-    """Yield (selector, class) for every openwindow event until the deadline; no polling, no sleeps."""
+def watch_openwindows(deadline: float, log, idle: float | None = None):
+    """Yield (selector, class) for every openwindow event until the deadline.
+
+    `idle` stops the watch once nothing has happened for that many seconds, so a caller that keeps
+    watching for late arrivals does not sit there until the hard deadline.
+    """
     try:
         conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         conn.connect(socket_path())
@@ -278,9 +282,11 @@ def watch_openwindows(deadline: float, log):
         return
 
     buffer = b""
+    quiet_since = time.monotonic()
     try:
         while True:
-            left = deadline - time.monotonic()
+            limit = deadline if idle is None else min(deadline, quiet_since + idle)
+            left = limit - time.monotonic()
             if left <= 0:
                 return
             ready, _, _ = select.select([conn], [], [], left)
@@ -297,6 +303,7 @@ def watch_openwindows(deadline: float, log):
                     continue
                 parts = text[len("openwindow>>"):].split(",")
                 if len(parts) >= 3:
+                    quiet_since = time.monotonic()
                     yield "address:" + norm_address(parts[0]), parts[2]
     finally:
         conn.close()
@@ -396,7 +403,58 @@ def cmd_plan(args) -> int:
     return 0
 
 
+def acquire_lock() -> bool:
+    """Single-run guard.
+
+    apply is launched from two places (the compositor's autostart and the shell service) and a second
+    concurrent run could double-launch an app, so the second caller exits instead of working.
+    """
+    path = os.path.join(STATE_DIR, "apply.lock")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) > 300:
+            os.unlink(path)
+        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(handle, f"{os.getpid()}\n".encode())
+        os.close(handle)
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_lock() -> None:
+    try:
+        os.unlink(os.path.join(STATE_DIR, "apply.lock"))
+    except OSError:
+        pass
+
+
+def reconcile_arrivals(wanted: dict[str, dict], watch: float, cap: float, log, verbose: bool) -> int:
+    """Place profile windows that show up after the first pass.
+
+    Some apps (Electron ones especially) map a first window for their splash, then remap the real one,
+    and a remap is a fresh `openwindow` event on whatever workspace is current at that moment. Watching
+    the event stream for a while after the initial pass is what stops such a window from staying on
+    workspace 1. The watch stops once the stream has been quiet for `watch` seconds, at most `cap`.
+    """
+    moved = 0
+    deadline = time.monotonic() + cap
+    for selector, klass in watch_openwindows(deadline, log, idle=watch):
+        spec = wanted.get(klass)
+        if not spec:
+            continue
+        client = client_by_address(selector)
+        if client and on_workspace(client, spec["workspace"]):
+            continue
+        time.sleep(0.4)
+        if move_window(selector, spec["workspace"], timeout=15):
+            moved += 1
+            log_line(f"late arrival placed: {klass} -> {spec['workspace']}", verbose)
+    return moved
+
+
 def cmd_apply(args) -> int:
+    started = time.monotonic()
     profile = load_profile()
     active_mode = mode()
     if not args.quiet:
@@ -422,6 +480,17 @@ def cmd_apply(args) -> int:
         return 0
 
     live_classes = {client.get("class") for client in clients()}
+    if not acquire_lock():
+        print("another apply is already running; nothing to do")
+        return 0
+    try:
+        return apply_locked(args, profile, active_mode, live_classes)
+    finally:
+        release_lock()
+
+
+def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) -> int:
+    started = time.monotonic()
     wanted: dict[str, dict] = {}
     for workspace, leaves_ in workspace_leaves(profile).items():
         for leaf in leaves_:
@@ -515,6 +584,13 @@ def cmd_apply(args) -> int:
     time.sleep(args.settle)
     report_geometry(profile, active_mode, only_classes={klass for klass, _ in placed})
 
+    if args.watch > 0:
+        late = reconcile_arrivals(
+            wanted, args.watch, args.watch_cap, lambda message: log_line(message, args.verbose), args.verbose
+        )
+        if late and not args.quiet:
+            print(f"placed {late} late arrival(s)")
+
     for name, workspace in placed:
         print(f"placed {name} -> {workspace}")
     for name, reason in absent:
@@ -523,7 +599,11 @@ def cmd_apply(args) -> int:
     marker = os.path.join(STATE_DIR, "last-apply")
     with open(marker, "w") as handle:
         handle.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
-    log_line(f"apply mode={active_mode} placed={len(placed)} absent={len(absent)}", args.verbose)
+    elapsed = time.monotonic() - started
+    log_line(
+        f"apply mode={active_mode} placed={len(placed)} absent={len(absent)} in {elapsed:.1f}s",
+        args.verbose,
+    )
     return 1 if absent else 0
 
 
@@ -730,6 +810,18 @@ def main(argv=None) -> int:
     apply_parser.add_argument("--dry-run", action="store_true")
     apply_parser.add_argument("--timeout", type=float, default=LAUNCH_TIMEOUT)
     apply_parser.add_argument("--settle", type=float, default=1.5)
+    apply_parser.add_argument(
+        "--watch",
+        type=float,
+        default=float(os.environ.get("OMARCHY_LAYOUT_WATCH", "8")),
+        help="keep watching events this many seconds after the last one, to place late arrivals (0 disables)",
+    )
+    apply_parser.add_argument(
+        "--watch-cap",
+        type=float,
+        default=float(os.environ.get("OMARCHY_LAYOUT_WATCH_CAP", "60")),
+        help="hard limit for the late-arrival watch",
+    )
     apply_parser.add_argument("--verbose", action="store_true")
     apply_parser.add_argument("--quiet", action="store_true")
 

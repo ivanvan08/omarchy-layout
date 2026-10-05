@@ -60,9 +60,12 @@ Item {
     }
   }
 
-  // Fallback in case no event ever arrives (quiet desktop at startup).
+  // Fallback in case no event ever arrives (a quiet desktop at startup). Kept short: the windows
+  // should be up as early as the session allows, and Hyprland's first raw event normally lands first.
+  // `omarchy-layout apply` is idempotent, so a second, early launch from the compositor's own
+  // autostart is harmless and in fact the faster path.
   Timer {
-    interval: 5000
+    interval: 1000
     repeat: false
     running: true
     onTriggered: {

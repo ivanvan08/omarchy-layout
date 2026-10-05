@@ -139,6 +139,7 @@ omarchy-layout apply                # idempotent: launch what is missing, place 
 omarchy-layout apply --dry-run      # print the plan, change nothing
 omarchy-layout apply --verbose      # log launches, placements and the geometry table
 omarchy-layout apply --timeout 90   # seconds to wait per window (default 45)
+omarchy-layout apply --watch 0      # disable the late-arrival watch (see below)
 omarchy-layout plan                 # the same plan, read-only
 omarchy-layout status               # each profile window: running or not, on which workspace
 omarchy-layout status --compare     # adds expected vs actual rects and the worst delta
@@ -146,12 +147,20 @@ omarchy-layout save [workspace]     # overwrite that workspace's node from the l
 omarchy-layout list                 # one line per workspace
 ```
 
-`apply` does three things, and only the first one launches anything:
+`apply` does four things, and only the first one launches anything:
 
 1. launches every profile window that is not running, targeting a workspace the window does not
    choose by itself: it waits for the window's `openwindow` event on the Hyprland socket and moves it,
 2. re-places profile windows that are already running on the wrong workspace,
-3. compiles the profile and re-asserts the workspace rules, then reports the geometry diff.
+3. keeps watching the event stream until it has been quiet for `--watch` seconds (at most
+   `--watch-cap`) and places **late arrivals**: some apps, Electron ones especially, map a splash
+   window first and remap the real one afterwards, and a remap is a fresh event on whatever workspace
+   is current at that moment. Without this phase such a window stays wherever it happened to open,
+4. compiles the profile and re-asserts the workspace rules, then reports the geometry diff.
+
+A lock file (`~/.local/state/omarchy/layout/apply.lock`) makes concurrent runs impossible: `apply` is
+started both by the compositor's autostart and by the shell service, and two runs could otherwise
+double-launch an app. A second run prints `another apply is already running` and exits 0.
 
 It exits non-zero when a window did not appear or could not be moved, so a wrapper or the service log
 can tell a clean run from a partial one.
@@ -169,6 +178,8 @@ Environment overrides:
 | `OMARCHY_LAYOUT_STATE` | state directory (default `~/.local/state/omarchy/layout`) |
 | `OMARCHY_LAYOUT_FAKE_MONITORS` | comma-separated monitor names, to test the internal-panel branch without unplugging anything |
 | `OMARCHY_LAYOUT_LAUNCH_TIMEOUT` | default for `--timeout` |
+| `OMARCHY_LAYOUT_WATCH` | default for `--watch` (seconds of quiet before the late-arrival watch stops) |
+| `OMARCHY_LAYOUT_WATCH_CAP` | default for `--watch-cap` (hard limit for that watch) |
 
 State lives in `~/.local/state/omarchy/layout/`: `profile.lua` (compiled from the profile JSON),
 `scratchpad.json`, `last-apply` (ISO timestamp written by every run, including the automatic one) and
@@ -195,14 +206,39 @@ or `scrolling`.
 
 ## Startup
 
-`Service.qml` waits for the first Hyprland raw event (or 5 s, whichever comes first), then runs
-`omarchy-layout apply` exactly once per shell start. The root type is `Item`, not `Service`: a file
-named `Service.qml` whose root is `Service` inherits from itself and the shell refuses it with
-`Service is instantiated recursively`. First-party services are plain `Item`s too
-(`plugins/services/battery/Service.qml`).
+There are two launch points, and both are wanted:
+
+- **The compositor's own autostart**, which is the fast path. Add to `~/.config/hypr/autostart.lua`:
+
+  ```lua
+  o.launch_on_start("bash -c 'sleep 1 && ~/.local/bin/omarchy-layout apply --quiet'")
+  ```
+
+  This runs as soon as the Hyprland config is loaded, before the shell exists, so the windows come up
+  as early as the session allows. `apply` is idempotent and locked, so the second launch point costs
+  nothing.
+- **The shell service** (`Service.qml`), which is the safety net: it waits for the first Hyprland raw
+  event (or 1 s, whichever comes first) and runs `omarchy-layout apply` once per shell start. It picks
+  up whatever the autostart missed, including windows that arrived late.
+
+The root type of `Service.qml` is `Item`, not `Service`: a file named `Service.qml` whose root is
+`Service` inherits from itself and the shell refuses it with `Service is instantiated recursively`.
+First-party services are plain `Item`s too (`plugins/services/battery/Service.qml`).
 
 ## Troubleshooting
 
+- **A window sits on the wrong workspace right after login.** Apps that remap their window after
+  starting (Electron ones especially) land on whatever workspace is current at that moment. The
+  late-arrival watch is what fixes it; the log says when it fired:
+
+  ```sh
+  grep "late arrival placed" ~/.local/state/omarchy/layout/log
+  ```
+
+  Raise `--watch` if an app remaps later than the watch window.
+- **Something launched twice at login.** Two applies can both look for a missing window; the lock file
+  exists to prevent that. If you see it, check that only one `apply` is in flight and that
+  `~/.local/state/omarchy/layout/apply.lock` is not stale (it is ignored after 5 minutes).
 - **Nothing happens at login.** Check the three links exist, that `hyprctl configerrors` is empty, that
   the plugin id is in `shell.json` `plugins[]`, and that `omarchy-layout apply` works when run by hand.
 - **`hyprctl dispatch <name>` does not work.** Under the Lua parser the argument is wrapped as
