@@ -286,6 +286,43 @@ To re-apply the layout from the Omarchy menu, add this to
 The parent is inferred from the dotted id, so `layout` becomes a root entry and `layout.apply` its
 child.
 
+## Manual resizing
+
+Hyprland has no resize hook for a custom layout: `resizeactive` (the `SUPER + arrow` bindings and the
+mouse drag) is implemented per built-in layout, a Lua provider is never asked, and no `layout_msg`
+arrives for it. Measured on Hyprland 0.56.2: the same `hl.dsp.window.resize({ relative = true })` that
+changes a tiled window's width under `dwindle` does nothing while the workspace runs
+`lua:omarchy-layout`.
+
+So a managed workspace is a fixed arrangement: exact cells, no manual resizing. A workspace where
+resizing matters is better off under a built-in layout, and the profile can say so per workspace:
+
+```json
+"2": { "layout": "dwindle", "split": "columns", "children": [ ... ] }
+```
+
+Such a workspace is still launched and targeted by `apply` (the windows go to the workspace, in profile
+order), but its geometry belongs to `dwindle` and the layout provider keeps its hands off it. Any
+built-in layout name works, `scrolling` included.
+
+The layout does learn from a manual geometry change when the host delivers one (`target.box` differing
+from the box the layout placed is turned into a new split ratio, and a single-window workspace keeps
+the box it was given), which is what makes the provider behave if a future Hyprland build does route
+resizing to custom layouts.
+
+## Diagnostics
+
+Lua `print` from the config state does not reach the compositor log, so the layout writes to
+`/tmp/omarchy-layout-debug.log` **only while that file exists**:
+
+```sh
+touch /tmp/omarchy-layout-debug.log     # turn diagnostics on
+rm /tmp/omarchy-layout-debug.log        # turn them off
+```
+
+Each line records a recalculation: the work area, the window set, every cell the layout computed,
+every ratio it learned, and any layout message the compositor sent.
+
 ## Tests
 
 The placement rules are checked hermetically: no session, no compositor, no live state, synthetic app

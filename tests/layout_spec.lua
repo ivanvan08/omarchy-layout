@@ -103,8 +103,10 @@ end
 -- The real targets are read-only host objects: writing a field to one raises
 -- "attempt to modify read-only hl object". The fakes enforce the same rule, so any assignment the
 -- layout makes to a host object fails the test instead of only spamming the compositor log.
-local function make_target(klass, workspace, on_place)
+local function make_target(klass, workspace, placed, states, index)
   local window = { class = klass, workspace = { id = workspace } }
+  local state = { box = nil }
+  states[klass] = state
   setmetatable(window, {
     __newindex = function()
       error("attempt to modify read-only hl object", 2)
@@ -114,8 +116,23 @@ local function make_target(klass, workspace, on_place)
   local target = {}
   setmetatable(target, {
     __index = function(_, key)
+      if key == "index" then
+        return index
+      end
       if key == "place" then
-        return on_place
+        return function(_, box)
+          state.box = box
+          placed[klass] = box
+        end
+      end
+      if key == "set_box" then
+        return function(_, box)
+          state.box = box
+          placed[klass] = box
+        end
+      end
+      if key == "box" then
+        return state.box
       end
       if key == "window" then
         return window
@@ -129,19 +146,26 @@ local function make_target(klass, workspace, on_place)
   return target
 end
 
-local function run(classes, workspace)
-  local placed = {}
-  local ctx = { area = AREA, targets = {} }
+local function targets_for(classes, workspace, placed, states)
+  local targets = {}
+  for i, klass in ipairs(classes) do
+    targets[#targets + 1] = make_target(klass, workspace, placed, states, i)
+  end
+  return targets
+end
+
+local function recalculate(targets)
+  local ctx = { area = AREA, targets = targets }
   ctx.split = function(_, box, side, ratio)
     return split(box, side, ratio)
   end
-  for _, klass in ipairs(classes) do
-    ctx.targets[#ctx.targets + 1] = make_target(klass, workspace, function(_, box)
-      placed[klass] = box
-    end)
-  end
   registered.recalculate(ctx)
-  return placed
+end
+
+local function run(classes, workspace)
+  local placed, states = {}, {}
+  recalculate(targets_for(classes, workspace, placed, states))
+  return placed, states
 end
 
 local function fmt(box)
@@ -223,7 +247,7 @@ check("the outside window takes the right side", other.x > extra[classes[3]].x,
   fmt(other) .. " vs " .. fmt(extra[classes[3]]))
 check("the profile block keeps its left edge", extra[classes[1]].x == AREA.x)
 
-check("an empty workspace is a no-op", next(run({}, 2)) == nil)
+check("an empty workspace is a no-op", next((run({}, 2))) == nil)
 
 local layouts = {}
 for _, rule in ipairs(rules) do
@@ -232,6 +256,32 @@ end
 check("a rule is registered per profile workspace", #rules == 2, tostring(#rules))
 check("ws 1 uses the custom layout", layouts["1"] == "lua:omarchy-layout", tostring(layouts["1"]))
 check("ws 2 uses the custom layout", layouts["2"] == "lua:omarchy-layout", tostring(layouts["2"]))
+
+-- Manual resize: the user drags a border, the compositor reports the new box, and the layout has to
+-- turn that into a new split ratio instead of writing its own cell back over it.
+local resized_placed, resized_states = {}, {}
+local resized_targets = targets_for(classes, 2, resized_placed, resized_states)
+recalculate(resized_targets)
+local pair_before = resized_placed[classes[1]].w + GAP + resized_placed[classes[2]].w
+local editor_before = resized_placed[classes[3]].w
+local sibling_before = resized_placed[classes[2]].w
+local widened = math.floor(pair_before * 0.75)
+
+resized_states[classes[1]].box = { x = AREA.x, y = AREA.y, w = widened, h = AREA.h }
+recalculate(resized_targets)
+
+check("a manual resize is kept", math.abs(resized_placed[classes[1]].w - widened) <= 2,
+  string.format("asked %d, got %d", widened, resized_placed[classes[1]].w))
+check("the neighbour gives up the space", resized_placed[classes[2]].w < sibling_before,
+  string.format("%d -> %d", sibling_before, resized_placed[classes[2]].w))
+check("the untouched split is untouched", resized_placed[classes[3]].w == editor_before,
+  string.format("%d vs %d", editor_before, resized_placed[classes[3]].w))
+check("cells stay disjoint after a resize", pairwise_disjoint({
+  resized_placed[classes[1]], resized_placed[classes[2]], resized_placed[classes[3]],
+}))
+check("cells stay inside the area after a resize",
+  inside(resized_placed[classes[1]], AREA) and inside(resized_placed[classes[2]], AREA)
+    and inside(resized_placed[classes[3]], AREA))
 
 --------------------------------------------------------------------------- internal mode
 
@@ -246,7 +296,7 @@ check("internal: ws 1 falls back to scrolling", internal_layouts["1"] == "scroll
   tostring(internal_layouts["1"]))
 check("internal: ws 2 falls back to scrolling", internal_layouts["2"] == "scrolling",
   tostring(internal_layouts["2"]))
-check("internal: no cells are placed", next(run({ "org.example.ChatA" }, 2)) == nil)
+check("internal: no cells are placed", next((run({ "org.example.ChatA" }, 2))) == nil)
 
 print(fails == 0 and "ALL PASS" or (fails .. " FAILURES"))
 os.exit(fails == 0 and 0 or 1)

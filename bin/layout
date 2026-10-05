@@ -492,12 +492,14 @@ def cmd_apply(args) -> int:
     if write_compiled(profile, active_mode, args.dry_run):
         print(f"compiled profile -> {compiled_file()}")
 
-    layout = workspace_layout_value(active_mode)
-    for workspace in (profile.get("workspaces") or {}):
+    for workspace, node in (profile.get("workspaces") or {}).items():
         if args.dry_run:
-            print(f"[dry-run] ws {workspace}: workspace_rule layout={layout}")
+            print(f"[dry-run] ws {workspace}: workspace_rule layout={workspace_layout(node, active_mode)}")
         else:
-            eval_lua(f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}" }})')
+            eval_lua(
+                f'hl.workspace_rule({{ workspace = "{workspace}", '
+                f'layout = "{workspace_layout(node, active_mode)}" }})'
+            )
     persisted = write_workspace_layouts(profile, active_mode, args.dry_run)
     if persisted and not args.quiet:
         print(f"persisted layout rules for {len(persisted)} workspace(s) in {os.path.dirname(persisted[0])}")
@@ -642,6 +644,20 @@ def workspace_layout_value(active_mode: str) -> str:
     return SCROLLING if active_mode == "internal" else LAYOUT_REF
 
 
+def workspace_layout(node: dict, active_mode: str) -> str:
+    """The layout a profile workspace should run.
+
+    A workspace node may opt out of the managed custom layout with `"layout": "dwindle"` (or
+    "scrolling"): Hyprland has no resize hook for custom layouts, so a workspace where manual resizing
+    matters is better served by a built-in layout. Such a workspace is still launched and targeted by
+    apply, it just keeps whatever geometry its own layout gives it.
+    """
+    override = node.get("layout")
+    if override:
+        return override
+    return workspace_layout_value(active_mode)
+
+
 def write_workspace_layouts(profile: dict, active_mode: str, dry_run: bool) -> list[str]:
     """Persist the per-workspace layout rule the way Omarchy itself does.
 
@@ -650,14 +666,13 @@ def write_workspace_layouts(profile: dict, active_mode: str, dry_run: bool) -> l
     those files survive a reload, and the files left behind by the retired omarchy-session tool
     otherwise win the race and hand the workspace dwindle or scrolling instead of our layout.
     """
-    layout = workspace_layout_value(active_mode)
     directory = os.path.expanduser("~/.local/state/omarchy/workspace-layouts")
     written = []
-    for workspace in profile.get("workspaces") or {}:
+    for workspace, node in (profile.get("workspaces") or {}).items():
         path = os.path.join(directory, f"{workspace}.lua")
         text = (
             "-- written by omarchy-layout - https://github.com/ivanvan08/omarchy-layout\n"
-            f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}" }})\n'
+            f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{workspace_layout(node, active_mode)}" }})\n'
         )
         if os.path.exists(path):
             with open(path) as handle:
@@ -681,6 +696,10 @@ def report_geometry(profile: dict, active_mode: str, only_classes: set[str] | No
     live = clients()
     worst = 0
     for workspace, node in sorted((profile.get("workspaces") or {}).items(), key=lambda kv: float(kv[0])):
+        if node.get("layout"):
+            if not quiet:
+                print(f"  ws {workspace} unmanaged (layout={node['layout']}); geometry is not ours")
+            continue
         for klass, (ex, ey, ew, eh) in expected_boxes(node, area):
             if only_classes and klass not in only_classes:
                 continue
