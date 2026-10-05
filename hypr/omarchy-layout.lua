@@ -357,8 +357,8 @@ end
 -- error overlay. Registration is by name, so re-running it is harmless.
 pcall(hl.layout.register, LAYOUT_NAME, {
   recalculate = recalculate,
-  -- Resize and move intents reach a custom layout as messages. Nothing here claims them yet; the
-  -- print is what makes the vocabulary visible in the compositor log while that is being worked out.
+  -- Resize and move intents would reach a custom layout as messages; none arrive on Hyprland 0.56.2.
+  -- The diagnostics file records any that do.
   layout_msg = function(_ctx, msg)
     dbg("[layout_msg] %s", tostring(msg))
     return false
@@ -373,4 +373,36 @@ for workspace, node in pairs((profile or {}).workspaces or {}) do
     layout = ((profile or {}).mode == "internal") and "scrolling" or LAYOUT_REF
   end
   hl.workspace_rule({ workspace = tostring(workspace), layout = layout })
+end
+
+-- Send every profile window to its workspace at map time. Launch-and-move from the CLI cannot do this
+-- reliably: an app that shows a splash or updater window first (Discord) maps its real window much
+-- later, on whatever workspace is current then. A compositor rule has no timing to lose.
+-- `silent` keeps focus where the user is. Scratchpad entries get no rule: their class is shared with
+-- every other window of the same terminal, which would all be dragged into the scratchpad.
+-- A leaf can opt out with "rule": false.
+local function regex_escape(text)
+  return (text:gsub("[%^%$%(%)%.%[%]%*%+%-%?%{%}%|\\]", "\\%0"))
+end
+
+local function leaves_of(node, out)
+  if node.class then
+    out[#out + 1] = node
+    return out
+  end
+  for _, child in ipairs(node.children or {}) do
+    leaves_of(child, out)
+  end
+  return out
+end
+
+for workspace, node in pairs((profile or {}).workspaces or {}) do
+  for _, leaf in ipairs(leaves_of(node or {}, {})) do
+    if leaf.rule ~= false then
+      pcall(hl.window_rule, {
+        match = { class = "^" .. regex_escape(leaf.class) .. "$" },
+        workspace = tostring(workspace) .. " silent",
+      })
+    end
+  end
 end

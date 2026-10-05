@@ -39,7 +39,7 @@ return {
       ["children"] = {
         { ["split"] = "columns", ["ratios"] = { 0.5, 0.5 }, ["children"] = {
           { ["app"] = "chat-a", ["class"] = "org.example.ChatA" },
-          { ["app"] = "chat-b", ["class"] = "org.example.ChatB" },
+          { ["app"] = "chat-b", ["class"] = "org.example.ChatB", ["rule"] = false },
         } },
         { ["app"] = "editor", ["class"] = "org.example.Editor" },
       },
@@ -70,15 +70,16 @@ local function write_profile(text)
   handle:close()
 end
 
-local registered, rules = nil, {}
+local registered, rules, window_rules = nil, {}, {}
 
 hl = {
   layout = { register = function(_name, provider) registered = provider end },
   workspace_rule = function(spec) rules[#rules + 1] = spec end,
+  window_rule = function(spec) window_rules[#window_rules + 1] = spec end,
 }
 
 local function load_module()
-  registered, rules = nil, {}
+  registered, rules, window_rules = nil, {}, {}
   dofile(module_path)
   assert(registered and registered.recalculate, "layout was not registered")
 end
@@ -256,6 +257,20 @@ end
 check("a rule is registered per profile workspace", #rules == 2, tostring(#rules))
 check("ws 1 uses the custom layout", layouts["1"] == "lua:omarchy-layout", tostring(layouts["1"]))
 check("ws 2 uses the custom layout", layouts["2"] == "lua:omarchy-layout", tostring(layouts["2"]))
+
+-- Window rules: every profile window is sent to its workspace at map time, silently, with the class
+-- matched exactly; the scratchpad entry (shared terminal class) and an opted-out leaf get none.
+local rule_for = {}
+for _, spec in ipairs(window_rules) do
+  rule_for[spec.match.class] = spec.workspace
+end
+check("a window rule per profile window", #window_rules == 3, tostring(#window_rules))
+check("the class is matched exactly and escaped", rule_for["^org\\.example\\.Editor$"] == "2 silent",
+  tostring(rule_for["^org\\.example\\.Editor$"]))
+check("single-leaf workspaces get a rule too", rule_for["^org\\.example\\.Browser$"] == "1 silent",
+  tostring(rule_for["^org\\.example\\.Browser$"]))
+check("an opted-out leaf gets no rule", rule_for["^org\\.example\\.ChatB$"] == nil)
+check("the scratchpad class gets no rule", rule_for["^org\\.example\\.Terminal$"] == nil)
 
 -- Manual resize: the user drags a border, the compositor reports the new box, and the layout has to
 -- turn that into a new split ratio instead of writing its own cell back over it.

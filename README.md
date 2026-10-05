@@ -131,6 +131,14 @@ Placement rules:
 - `scratchpad` entries are tracked by the address of the window this tool launched (state file
   `scratchpad.json`), not by class, because a terminal-running app shares its class with every other
   terminal of the same emulator.
+- Every regular leaf also gets a **window rule** at config load:
+  `hl.window_rule({ match = { class = "^<class>$" }, workspace = "<N> silent" })`. The compositor then
+  puts the window on its workspace the moment it maps, however late that is, and without moving
+  focus. This is what catches apps that map a splash or updater window first and their real window
+  much later (Discord): launch-and-move from the CLI would only ever catch the first window. The
+  side effect is that **any** new window of that class opens on that workspace; a leaf opts out with
+  `"rule": false`. Scratchpad entries never get a rule, since their class is shared. Rules are
+  registered when the config loads, so a profile edit takes effect after `hyprctl reload`.
 
 ## CLI
 
@@ -227,15 +235,14 @@ First-party services are plain `Item`s too (`plugins/services/battery/Service.qm
 
 ## Troubleshooting
 
-- **A window sits on the wrong workspace right after login.** Apps that remap their window after
-  starting (Electron ones especially) land on whatever workspace is current at that moment. The
-  late-arrival watch is what fixes it; the log says when it fired:
+- **A window sits on the wrong workspace right after login.** Check that its leaf has no
+  `"rule": false` and that the class in the profile is exactly what `hyprctl clients -j` reports: the
+  window rule matches the class exactly. After editing the profile, `hyprctl reload` re-registers the
+  rules. The late-arrival watch is the second line of defence; the log says when it fired:
 
   ```sh
   grep "late arrival placed" ~/.local/state/omarchy/layout/log
   ```
-
-  Raise `--watch` if an app remaps later than the watch window.
 - **Something launched twice at login.** Two applies can both look for a missing window; the lock file
   exists to prevent that. If you see it, check that only one `apply` is in flight and that
   `~/.local/state/omarchy/layout/apply.lock` is not stale (it is ignored after 5 minutes).
