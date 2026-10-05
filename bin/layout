@@ -403,23 +403,53 @@ def cmd_plan(args) -> int:
     return 0
 
 
+def lock_is_stale(path: str) -> bool:
+    """A killed run cannot release its lock, so the lock is only trusted while its process lives."""
+    try:
+        with open(path) as handle:
+            text = handle.read().strip()
+    except OSError:
+        return True
+    try:
+        pid = int(text)
+    except ValueError:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    try:
+        return time.time() - os.path.getmtime(path) > 300
+    except OSError:
+        return True
+
+
 def acquire_lock() -> bool:
     """Single-run guard.
 
     apply is launched from two places (the compositor's autostart and the shell service) and a second
-    concurrent run could double-launch an app, so the second caller exits instead of working.
+    concurrent run could double-launch an app, so the second caller exits instead of working. A run
+    killed by a shell or session restart cannot release the lock, so a lock whose process is gone is
+    taken over instead of blocking the next login for minutes.
     """
     path = os.path.join(STATE_DIR, "apply.lock")
     os.makedirs(STATE_DIR, exist_ok=True)
-    try:
-        if os.path.exists(path) and time.time() - os.path.getmtime(path) > 300:
-            os.unlink(path)
-        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(handle, f"{os.getpid()}\n".encode())
-        os.close(handle)
-        return True
-    except FileExistsError:
-        return False
+    for _attempt in range(2):
+        try:
+            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(handle, f"{os.getpid()}\n".encode())
+            os.close(handle)
+            return True
+        except FileExistsError:
+            if not lock_is_stale(path):
+                return False
+            try:
+                os.unlink(path)
+            except OSError:
+                return False
+    return False
 
 
 def release_lock() -> None:
@@ -482,6 +512,7 @@ def cmd_apply(args) -> int:
     live_classes = {client.get("class") for client in clients()}
     if not acquire_lock():
         print("another apply is already running; nothing to do")
+        log_line("apply skipped: another run holds the lock", args.verbose)
         return 0
     try:
         return apply_locked(args, profile, active_mode, live_classes)
