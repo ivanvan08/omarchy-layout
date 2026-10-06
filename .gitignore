@@ -1,3 +1,6 @@
 # Your own window profile: keep it out of the public repo.
 # `omarchy-layout apply` prefers this file over profiles/example.json.
 profiles/windows.json
+
+# Python bytecode from py_compile and the test runner.
+__pycache__/
