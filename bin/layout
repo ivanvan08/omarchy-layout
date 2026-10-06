@@ -267,11 +267,12 @@ def socket_path() -> str:
     return os.path.join(SOCK_DIR, INSTANCE, ".socket2.sock")
 
 
-def watch_openwindows(deadline: float, log, idle: float | None = None):
-    """Yield (selector, class) for every openwindow event until the deadline.
+def watch_events(deadline: float, log, idle: float | None = None, keep_going=None):
+    """Yield (kind, selector, class) for openwindow and closewindow events until the deadline.
 
-    `idle` stops the watch once nothing has happened for that many seconds, so a caller that keeps
-    watching for late arrivals does not sit there until the hard deadline.
+    `class` is None for closewindow, which carries only the address. `idle` stops the watch once
+    nothing has happened for that many seconds, unless `keep_going()` says there is still something to
+    wait for, in which case the quiet period starts over (the hard deadline always wins).
     """
     try:
         conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -288,10 +289,13 @@ def watch_openwindows(deadline: float, log, idle: float | None = None):
             limit = deadline if idle is None else min(deadline, quiet_since + idle)
             left = limit - time.monotonic()
             if left <= 0:
+                if limit < deadline and keep_going is not None and keep_going():
+                    quiet_since = time.monotonic()
+                    continue
                 return
             ready, _, _ = select.select([conn], [], [], left)
             if not ready:
-                return
+                continue
             chunk = conn.recv(65536)
             if not chunk:
                 return
@@ -299,12 +303,14 @@ def watch_openwindows(deadline: float, log, idle: float | None = None):
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 text = line.decode("utf-8", "replace")
-                if not text.startswith("openwindow>>"):
-                    continue
-                parts = text[len("openwindow>>"):].split(",")
-                if len(parts) >= 3:
+                if text.startswith("openwindow>>"):
+                    parts = text[len("openwindow>>"):].split(",")
+                    if len(parts) >= 3:
+                        quiet_since = time.monotonic()
+                        yield "openwindow", "address:" + norm_address(parts[0]), parts[2]
+                elif text.startswith("closewindow>>"):
                     quiet_since = time.monotonic()
-                    yield "address:" + norm_address(parts[0]), parts[2]
+                    yield "closewindow", "address:" + norm_address(text[len("closewindow>>"):]), None
     finally:
         conn.close()
 
@@ -316,7 +322,7 @@ def poll_openwindows(deadline: float):
             address = norm_address(str(client.get("address") or ""))
             if address not in seen and (client.get("mapped") or 0):
                 seen.add(address)
-                yield "address:" + address, client.get("class")
+                yield "openwindow", "address:" + address, client.get("class")
         time.sleep(0.25)
 
 
@@ -459,28 +465,152 @@ def release_lock() -> None:
         pass
 
 
-def reconcile_arrivals(wanted: dict[str, dict], watch: float, cap: float, log, verbose: bool) -> int:
-    """Place profile windows that show up after the first pass.
+def unmanaged_workspaces(profile: dict) -> dict[str, dict]:
+    """Profile workspaces that run a built-in layout (`"layout": "dwindle"`) instead of ours."""
+    return {str(ws): node for ws, node in (profile.get("workspaces") or {}).items() if node.get("layout")}
 
-    Some apps (Electron ones especially) map a first window for their splash, then remap the real one,
-    and a remap is a fresh `openwindow` event on whatever workspace is current at that moment. Watching
-    the event stream for a while after the initial pass is what stops such a window from staying on
-    workspace 1. The watch stops once the stream has been quiet for `watch` seconds, at most `cap`.
+
+def slot_key(rect: tuple[int, int]) -> tuple[int, int]:
+    """Reading order of a cell: left to right, then top to bottom."""
+    return (rect[0], rect[1])
+
+
+def desired_order(node: dict, area: tuple[int, int, int, int]) -> list[str]:
+    """Classes of a workspace tree in the reading order of the cells the profile gives them."""
+    return [klass for klass, box in sorted(expected_boxes(node, area), key=lambda kb: slot_key(kb[1]))]
+
+
+def plan_swaps(current: list[str], desired: list[str]) -> list[tuple[int, int]]:
+    """Slot swaps that turn `current` into `desired`; both must hold the same classes.
+
+    Selection order: slot i gets its wanted class from the first later slot that holds it, so the
+    result is at most len - 1 swaps and never touches a slot that is already right.
     """
-    moved = 0
-    deadline = time.monotonic() + cap
-    for selector, klass in watch_openwindows(deadline, log, idle=watch):
+    order = list(current)
+    swaps: list[tuple[int, int]] = []
+    for i, want in enumerate(desired):
+        if order[i] == want:
+            continue
+        j = next(k for k in range(i + 1, len(order)) if order[k] == want)
+        swaps.append((i, j))
+        order[i], order[j] = order[j], order[i]
+    return swaps
+
+
+def tiled_on(workspace: str) -> list[dict]:
+    live = [
+        c
+        for c in clients()
+        if on_workspace(c, workspace) and c.get("mapped") and not c.get("floating") and not c.get("hidden")
+    ]
+    live.sort(key=lambda c: slot_key(c["at"]))
+    return live
+
+
+def cursor_position() -> tuple[int, int] | None:
+    data = hyprctl_json("cursorpos")
+    if not isinstance(data, dict) or "x" not in data or "y" not in data:
+        return None
+    return int(data["x"]), int(data["y"])
+
+
+def reorder_workspace(workspace: str, node: dict, area: tuple[int, int, int, int], verbose: bool) -> str:
+    """Put the windows of a built-in-layout workspace into profile order.
+
+    A built-in layout decides where a new window goes by itself (dwindle splits the window nearest the
+    cursor), so a workspace whose windows arrive at different times ends up in an order nobody chose.
+    The windows are swapped into profile order with `hl.dsp.window.swap({ window, target })`, which
+    does not move focus or switch the visible workspace; it only warps the cursor, which is put back.
+
+    Returns "ok" (already in order), "reordered", "incomplete" (a profile window is missing),
+    "foreign" (windows outside the profile are there, so the order is the user's business) or "failed".
+    """
+    desired = desired_order(node, area)
+    live = tiled_on(workspace)
+    current = [c.get("class") for c in live]
+    if any(klass not in desired for klass in current):
+        return "foreign"
+    if sorted(current) != sorted(desired):
+        return "incomplete"
+    swaps = plan_swaps(current, desired)
+    if not swaps:
+        return "ok"
+
+    cursor = cursor_position()
+    addresses = [norm_address(str(c["address"])) for c in live]
+    for i, j in swaps:
+        dispatch(f'hl.dsp.window.swap({{ window = "address:{addresses[j]}", target = "address:{addresses[i]}" }})')
+        addresses[i], addresses[j] = addresses[j], addresses[i]
+    if cursor:
+        dispatch(f"hl.dsp.cursor.move({{ x = {cursor[0]}, y = {cursor[1]} }})")
+
+    time.sleep(0.3)
+    after = [c.get("class") for c in tiled_on(workspace)]
+    if after == desired:
+        log_line(f"reordered ws {workspace}: {' | '.join(current)} -> {' | '.join(after)}", verbose)
+        return "reordered"
+    log_line(f"reorder failed on ws {workspace}: wanted {' | '.join(desired)}, got {' | '.join(after)}", verbose)
+    return "failed"
+
+
+def reconcile_arrivals(
+    profile: dict, wanted: dict[str, dict], launched: set[str], watch: float, cap: float, log, verbose: bool
+) -> tuple[int, int]:
+    """Place profile windows that show up after the first pass and keep built-in-layout workspaces in order.
+
+    Some apps (Discord) map an updater window first and their real window much later. The window rule
+    already puts every such window on its workspace; this watch moves any that slipped through and, on
+    workspaces that run a built-in layout, swaps the windows back into profile order after every
+    arrival or departure, because the layout itself places a late window wherever the cursor happens to
+    be. When this run launched a window of such a workspace, the watch holds for the full `cap`: the real
+    window can arrive long after a quiet updater, and the order has to be fixed then too.
+
+    Returns (windows moved, workspaces reordered).
+    """
+    moved = reordered = 0
+    start = time.monotonic()
+    deadline = start + cap
+    unmanaged = unmanaged_workspaces(profile)
+    area = work_area()
+    order_classes = {leaf["class"] for node in unmanaged.values() for leaf in leaves(node)}
+    hold_until = deadline if launched & order_classes else start
+    known = {norm_address(str(c.get("address") or "")): c.get("class") for c in clients()}
+
+    def settle() -> bool:
+        nonlocal reordered
+        incomplete = False
+        for workspace, node in unmanaged.items():
+            state = reorder_workspace(workspace, node, area, verbose)
+            if state == "reordered":
+                reordered += 1
+            elif state == "incomplete":
+                incomplete = True
+        return incomplete
+
+    pending = settle()
+    keep_going = lambda: pending or time.monotonic() < hold_until  # noqa: E731
+    for kind, selector, klass in watch_events(deadline, log, idle=watch, keep_going=keep_going):
+        address = norm_address(selector)
+        if kind == "closewindow":
+            klass = known.pop(address, None)
+            if klass in order_classes:
+                time.sleep(0.5)
+                pending = settle()
+            continue
+
+        known[address] = klass
         spec = wanted.get(klass)
-        if not spec:
-            continue
-        client = client_by_address(selector)
-        if client and on_workspace(client, spec["workspace"]):
-            continue
-        time.sleep(0.4)
-        if move_window(selector, spec["workspace"], timeout=15):
-            moved += 1
-            log_line(f"late arrival placed: {klass} -> {spec['workspace']}", verbose)
-    return moved
+        if spec:
+            client = client_by_address(selector)
+            if not (client and on_workspace(client, spec["workspace"])):
+                time.sleep(0.4)
+                if move_window(selector, spec["workspace"], timeout=15):
+                    moved += 1
+                    log_line(f"late arrival placed: {klass} -> {spec['workspace']}", verbose)
+        if klass in order_classes:
+            time.sleep(0.5)
+            pending = settle()
+    return moved, reordered
 
 
 def cmd_apply(args) -> int:
@@ -572,7 +702,9 @@ def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) 
     pending_scratch = {entry["app"]: entry for entry in scratch_missing}
     if pending or pending_scratch:
         deadline = time.monotonic() + args.timeout
-        for selector, klass in watch_openwindows(deadline, lambda message: log_line(message, args.verbose)):
+        for kind, selector, klass in watch_events(deadline, lambda message: log_line(message, args.verbose)):
+            if kind != "openwindow":
+                continue
             if klass in pending:
                 results[klass] = selector
                 pending.discard(klass)
@@ -618,11 +750,19 @@ def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) 
     report_geometry(profile, active_mode, only_classes={klass for klass, _ in placed})
 
     if args.watch > 0:
-        late = reconcile_arrivals(
-            wanted, args.watch, args.watch_cap, lambda message: log_line(message, args.verbose), args.verbose
+        late, reordered = reconcile_arrivals(
+            profile,
+            wanted,
+            set(missing),
+            args.watch,
+            args.watch_cap,
+            lambda message: log_line(message, args.verbose),
+            args.verbose,
         )
         if late and not args.quiet:
             print(f"placed {late} late arrival(s)")
+        if reordered and not args.quiet:
+            print(f"put {reordered} workspace(s) back into profile order")
 
     for name, workspace in placed:
         print(f"placed {name} -> {workspace}")
@@ -843,6 +983,28 @@ def cmd_save(args) -> int:
     return 0
 
 
+def cmd_order(args) -> int:
+    """Put built-in-layout workspaces into profile order once, without launching anything."""
+    profile = load_profile()
+    if mode() == "internal":
+        print("internal panel: workspaces scroll, there is no order to fix")
+        return 0
+    area = work_area()
+    unmanaged = unmanaged_workspaces(profile)
+    if args.workspace:
+        unmanaged = {ws: node for ws, node in unmanaged.items() if ws == str(args.workspace)}
+    if not unmanaged:
+        print("no built-in-layout workspace in the profile" + (f" matches {args.workspace}" if args.workspace else ""))
+        return 0
+    status = 0
+    for workspace, node in sorted(unmanaged.items(), key=lambda kv: float(kv[0])):
+        state = reorder_workspace(workspace, node, area, args.verbose)
+        print(f"ws {workspace}: {state}")
+        if state == "failed":
+            status = 1
+    return status
+
+
 def cmd_list(args) -> int:
     profile = load_profile()
     for workspace, leaves_ in sorted(workspace_leaves(profile).items(), key=lambda kv: float(kv[0])):
@@ -881,6 +1043,9 @@ def main(argv=None) -> int:
     save_parser = sub.add_parser("save", help="overwrite a workspace node from the live session")
     save_parser.add_argument("workspace", nargs="?", help="workspace id (default: the focused one)")
     sub.add_parser("list", help="one line per workspace")
+    order_parser = sub.add_parser("order", help="swap built-in-layout workspaces back into profile order")
+    order_parser.add_argument("workspace", nargs="?", help="only this workspace")
+    order_parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args(argv)
     return {
@@ -889,6 +1054,7 @@ def main(argv=None) -> int:
         "status": cmd_status,
         "save": cmd_save,
         "list": cmd_list,
+        "order": cmd_order,
     }[args.command](args)
 
 

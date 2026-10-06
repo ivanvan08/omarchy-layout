@@ -153,9 +153,10 @@ omarchy-layout status               # each profile window: running or not, on wh
 omarchy-layout status --compare     # adds expected vs actual rects and the worst delta
 omarchy-layout save [workspace]     # overwrite that workspace's node from the live session
 omarchy-layout list                 # one line per workspace
+omarchy-layout order [workspace]    # swap built-in-layout workspaces back into profile order
 ```
 
-`apply` does four things, and only the first one launches anything:
+`apply` does five things, and only the first one launches anything:
 
 1. launches every profile window that is not running, targeting a workspace the window does not
    choose by itself: it waits for the window's `openwindow` event on the Hyprland socket and moves it,
@@ -164,7 +165,9 @@ omarchy-layout list                 # one line per workspace
    `--watch-cap`) and places **late arrivals**: some apps, Electron ones especially, map a splash
    window first and remap the real one afterwards, and a remap is a fresh event on whatever workspace
    is current at that moment. Without this phase such a window stays wherever it happened to open,
-4. compiles the profile and re-asserts the workspace rules, then reports the geometry diff.
+4. keeps **built-in-layout workspaces in profile order** (see below) after every arrival or departure
+   during that watch,
+5. compiles the profile and re-asserts the workspace rules, then reports the geometry diff.
 
 A lock file (`~/.local/state/omarchy/layout/apply.lock`) makes concurrent runs impossible: `apply` is
 started both by the compositor's autostart and by the shell service, and two runs could otherwise
@@ -312,6 +315,27 @@ Such a workspace is still launched and targeted by `apply` (the windows go to th
 order), but its geometry belongs to `dwindle` and the layout provider keeps its hands off it. Any
 built-in layout name works, `scrolling` included.
 
+### Order on a built-in-layout workspace
+
+A built-in layout decides by itself where a new window goes. With Hyprland's defaults
+(`dwindle:use_active_for_splits = true`) a window that maps on a workspace that is not on screen splits
+the window **nearest the cursor** (`DwindleAlgorithm.cpp`, Hyprland 0.56.2), so when the apps of one
+workspace arrive at different times, which is normal at login, the order is decided by wherever the
+mouse happened to be.
+
+`apply` fixes that: after every arrival or departure on such a workspace it compares the windows'
+reading order (left to right, then top to bottom) with the profile's and swaps them back with
+`hl.dsp.window.swap({ window, target })`. That dispatcher changes neither focus nor the visible
+workspace; it warps the cursor, which `apply` puts back. When the run launched one of the workspace's
+windows itself, the watch holds for the whole `--watch-cap`, because an app with an updater window
+(Discord) maps its real window long after the updater went quiet.
+
+The order is enforced only while every window on the workspace belongs to the profile: a workspace with
+an extra window of yours is left as you arranged it. `omarchy-layout order` runs the same check once,
+on demand; it never launches anything and prints `ok`, `reordered`, `incomplete`, `foreign` or
+`failed` per workspace. The order is a sequence, not sizes: the cells are whatever the built-in layout
+makes of it.
+
 The layout does learn from a manual geometry change when the host delivers one (`target.box` differing
 from the box the layout placed is turned into a new split ratio, and a single-window workspace keeps
 the box it was given), which is what makes the provider behave if a future Hyprland build does route
@@ -345,6 +369,14 @@ disjoint and inside the work area, the gaps between adjacent cells are exact, a 
 cell without shifting the others, a window outside the profile is placed to the right of the profile
 block without overlapping, an empty workspace is a no-op, a rule is registered per profile workspace,
 and in internal mode the workspaces fall back to `scrolling` with no cells placed.
+
+The swap planning that restores profile order on a built-in-layout workspace has its own hermetic
+test: reading order of nested trees, the late-window-in-the-middle case, and every permutation of four
+windows sorted in at most three swaps.
+
+```sh
+python3 -m unittest tests/test_order.py
+```
 
 ## Uninstall
 
