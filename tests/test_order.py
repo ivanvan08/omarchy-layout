@@ -1,4 +1,4 @@
-"""Hermetic checks of the swap planning that puts built-in-layout workspaces into profile order.
+"""Hermetic checks of how built-in-layout (dwindle) workspaces are compared with their profile tree.
 
 Run: python3 -m unittest tests/test_order.py
 """
@@ -15,7 +15,8 @@ _spec = importlib.util.spec_from_loader("omarchy_layout_cli", _loader)
 cli = importlib.util.module_from_spec(_spec)
 _loader.exec_module(cli)
 
-AREA = (12, 42, 1176, 666)
+# The work area of the 3200x900 logical monitor with a 30 px bar, as dwindle sees it.
+AREA = (12, 42, 3176, 846)
 
 # Two chats sharing the left half, an editor alone in the right half.
 CHAT_WALL = {
@@ -32,47 +33,86 @@ CHAT_WALL = {
     ],
 }
 
+# Measured on the live session, 2026-10-07 17:01, after the old order check said "ok":
+# ChatA spans the left half and the other two share the right one.
+WRONG_TREE = [
+    ("ChatA", (12, 42, 1581, 846)),
+    ("ChatB", (1607, 42, 781, 846)),
+    ("Editor", (2402, 42, 786, 846)),
+]
+# The same session when the tree was right.
+RIGHT_TREE = [
+    ("ChatA", (12, 42, 781, 846)),
+    ("ChatB", (807, 42, 786, 846)),
+    ("Editor", (1607, 42, 1581, 846)),
+]
 
-def apply_swaps(order, swaps):
-    order = list(order)
-    for i, j in swaps:
-        order[i], order[j] = order[j], order[i]
-    return order
+
+def relabel(rects, order):
+    return [(klass, rect) for klass, (_, rect) in zip(order, rects)]
 
 
-class DesiredOrder(unittest.TestCase):
-    def test_columns_read_left_to_right(self):
-        self.assertEqual(cli.desired_order(CHAT_WALL, AREA), ["ChatA", "ChatB", "Editor"])
+class Classify(unittest.TestCase):
+    def test_a_window_spanning_the_wrong_half_needs_a_rebuild(self):
+        # Reads ChatA | ChatB | Editor left to right, which is what the old check compared.
+        self.assertEqual(cli.classify(WRONG_TREE, CHAT_WALL, AREA), "rebuild")
 
-    def test_rows_inside_columns_read_column_by_column(self):
-        node = {
-            "split": "columns",
-            "children": [
-                {"split": "rows", "children": [{"class": "Top"}, {"class": "Bottom"}]},
-                {"class": "Right"},
-            ],
-        }
-        self.assertEqual(cli.desired_order(node, AREA), ["Top", "Bottom", "Right"])
+    def test_the_profile_tree_is_ok(self):
+        self.assertEqual(cli.classify(RIGHT_TREE, CHAT_WALL, AREA), "ok")
+
+    def test_right_cells_with_the_wrong_windows_need_a_swap(self):
+        swapped = relabel(RIGHT_TREE, ["ChatA", "Editor", "ChatB"])
+        self.assertEqual(cli.classify(swapped, CHAT_WALL, AREA), "swap")
+
+    def test_a_missing_window_waits(self):
+        self.assertEqual(cli.classify(RIGHT_TREE[:2], CHAT_WALL, AREA), "incomplete")
+
+    def test_a_window_outside_the_profile_is_left_alone(self):
+        extra = RIGHT_TREE + [("Other", (1607, 500, 1581, 388))]
+        self.assertEqual(cli.classify(extra, CHAT_WALL, AREA), "foreign")
+
+
+class BuildPlan(unittest.TestCase):
+    def test_the_second_half_is_split_off_before_the_first_half_grows(self):
+        start, steps = cli.build_steps(CHAT_WALL)
+        self.assertEqual(start, "ChatA")
+        self.assertEqual(steps, [("Editor", "ChatA", "columns"), ("ChatB", "ChatA", "columns")])
+
+    def test_simulated_inserts_reproduce_the_profile_cells(self):
+        start, steps = cli.build_steps(CHAT_WALL)
+        cells = {start: (0.0, 0.0, 1.0, 1.0)}
+        for new, target, split in steps:
+            x, y, w, h = cells[target]
+            if split == "columns":
+                cells[target], cells[new] = (x, y, w / 2, h), (x + w / 2, y, w / 2, h)
+            else:
+                cells[target], cells[new] = (x, y, w, h / 2), (x, y + h / 2, w, h / 2)
+        self.assertEqual(cells["Editor"], (0.5, 0.0, 0.5, 1.0))
+        self.assertEqual(cells["ChatA"], (0.0, 0.0, 0.25, 1.0))
+        self.assertEqual(cells["ChatB"], (0.25, 0.0, 0.25, 1.0))
+
+    def test_three_columns_nest_to_the_right(self):
+        node = {"split": "columns", "children": [{"class": "A"}, {"class": "B"}, {"class": "C"}]}
+        self.assertEqual(cli.build_steps(node), ("A", [("B", "A", "columns"), ("C", "B", "columns")]))
+
+    def test_the_wall_is_buildable_on_a_wide_screen(self):
+        self.assertTrue(cli.build_feasible(CHAT_WALL, AREA, 1.0))
+
+    def test_rows_in_a_wide_cell_cannot_be_built(self):
+        # dwindle splits a wide cell side by side, whatever the profile asks.
+        node = {"split": "rows", "children": [{"class": "Top"}, {"class": "Bottom"}]}
+        self.assertFalse(cli.build_feasible(node, AREA, 1.0))
 
 
 class PlanSwaps(unittest.TestCase):
-    def test_late_window_in_the_middle_is_swapped_to_the_right(self):
-        # The case seen at login: the late window took the middle cell, the right one took its place.
-        current = ["ChatA", "Editor", "ChatB"]
-        desired = ["ChatA", "ChatB", "Editor"]
-        swaps = cli.plan_swaps(current, desired)
-        self.assertEqual(swaps, [(1, 2)])
-        self.assertEqual(apply_swaps(current, swaps), desired)
-
-    def test_ordered_workspace_needs_no_swap(self):
-        desired = ["ChatA", "ChatB", "Editor"]
-        self.assertEqual(cli.plan_swaps(desired, desired), [])
-
     def test_every_permutation_is_sorted_in_at_most_n_minus_one_swaps(self):
         desired = ["A", "B", "C", "D"]
         for current in itertools.permutations(desired):
-            swaps = cli.plan_swaps(list(current), desired)
-            self.assertEqual(apply_swaps(current, swaps), desired, current)
+            order = list(current)
+            swaps = cli.plan_swaps(order, desired)
+            for i, j in swaps:
+                order[i], order[j] = order[j], order[i]
+            self.assertEqual(order, desired, current)
             self.assertLessEqual(len(swaps), len(desired) - 1, current)
 
 

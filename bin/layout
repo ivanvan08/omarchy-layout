@@ -272,7 +272,8 @@ def watch_events(deadline: float, log, idle: float | None = None, keep_going=Non
 
     `class` is None for closewindow, which carries only the address. `idle` stops the watch once
     nothing has happened for that many seconds, unless `keep_going()` says there is still something to
-    wait for, in which case the quiet period starts over (the hard deadline always wins).
+    wait for, in which case the quiet period starts over with an ("idle", "", None) tick, so the caller
+    can retry what it is waiting on (the hard deadline always wins).
     """
     try:
         conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -291,6 +292,7 @@ def watch_events(deadline: float, log, idle: float | None = None, keep_going=Non
             if left <= 0:
                 if limit < deadline and keep_going is not None and keep_going():
                     quiet_since = time.monotonic()
+                    yield "idle", "", None
                     continue
                 return
             ready, _, _ = select.select([conn], [], [], left)
@@ -470,14 +472,78 @@ def unmanaged_workspaces(profile: dict) -> dict[str, dict]:
     return {str(ws): node for ws, node in (profile.get("workspaces") or {}).items() if node.get("layout")}
 
 
-def slot_key(rect: tuple[int, int]) -> tuple[int, int]:
-    """Reading order of a cell: left to right, then top to bottom."""
-    return (rect[0], rect[1])
+PARK = "special:omarchy-layout-park"
+# Pixel tolerance for "this window sits in that cell". Rounding and gap arithmetic differ by a few px;
+# a wrong tree differs by a whole cell, hundreds of px.
+SHAPE_TOLERANCE = 32
 
 
-def desired_order(node: dict, area: tuple[int, int, int, int]) -> list[str]:
-    """Classes of a workspace tree in the reading order of the cells the profile gives them."""
-    return [klass for klass, box in sorted(expected_boxes(node, area), key=lambda kb: slot_key(kb[1]))]
+def binarize(node: dict) -> dict:
+    """The binary tree dwindle builds for a profile node.
+
+    dwindle only ever splits one window in two, at default_split_ratio (1.0 = halves), so a node with three
+    children is two nested splits and the profile's ratios do not apply on a dwindle workspace: the user
+    owns the ratios there.
+    """
+    if "class" in node:
+        return {"class": node["class"]}
+    split = node.get("split", "columns")
+    children = [binarize(child) for child in node.get("children") or []]
+
+    def nest(items: list[dict]) -> dict:
+        if len(items) == 1:
+            return items[0]
+        return {"split": split, "ratios": [0.5, 0.5], "children": [items[0], nest(items[1:])]}
+
+    return nest(children) if children else {"split": split, "children": []}
+
+
+def natural_boxes(node: dict, area: tuple[int, int, int, int]) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """Cells of the dwindle tree for a profile node, with every split at one half."""
+    return expected_boxes(binarize(node), area)
+
+
+def match_slots(live: list[tuple[str, tuple]], expected: list[tuple[str, tuple]], tolerance: int = SHAPE_TOLERANCE):
+    """Pair each expected cell with the live window that occupies it, or None if the shapes differ.
+
+    Returns a list aligned with `expected`: the index into `live` of the window in that cell.
+    """
+    taken: set[int] = set()
+    slots: list[int] = []
+    for _klass, cell in expected:
+        hit = next(
+            (
+                i
+                for i, (_, rect) in enumerate(live)
+                if i not in taken and all(abs(a - b) <= tolerance for a, b in zip(rect, cell))
+            ),
+            None,
+        )
+        if hit is None:
+            return None
+        taken.add(hit)
+        slots.append(hit)
+    return slots
+
+
+def classify(live: list[tuple[str, tuple]], node: dict, area: tuple[int, int, int, int]) -> str:
+    """How a built-in-layout workspace compares with its profile tree.
+
+    "ok" (right windows in the right cells), "swap" (right cells, windows in the wrong ones), "rebuild"
+    (the tree itself is wrong, e.g. one window spans a half that two should share), "incomplete" (a
+    profile window is missing) or "foreign" (a window outside the profile, or two of one class, is there).
+    """
+    expected = natural_boxes(node, area)
+    want = sorted(klass for klass, _ in expected)
+    have = sorted(klass for klass, _ in live)
+    if any(klass not in want for klass in have) or len(set(have)) != len(have):
+        return "foreign"
+    if have != want:
+        return "incomplete"
+    slots = match_slots(live, expected)
+    if slots is None:
+        return "rebuild"
+    return "ok" if all(live[i][0] == expected[k][0] for k, i in enumerate(slots)) else "swap"
 
 
 def plan_swaps(current: list[str], desired: list[str]) -> list[tuple[int, int]]:
@@ -497,13 +563,56 @@ def plan_swaps(current: list[str], desired: list[str]) -> list[tuple[int, int]]:
     return swaps
 
 
+def first_leaf(node: dict) -> str:
+    return node["class"] if "class" in node else first_leaf(node["children"][0])
+
+
+def build_steps(node: dict) -> tuple[str, list[tuple[str, str, str]]]:
+    """Insertion plan that makes dwindle build the profile tree.
+
+    Returns (the class that stays, [(class to insert, class it splits, "columns" | "rows")]). dwindle
+    inserts a window by splitting one existing window, so a subtree [A | B] is made by putting B's first
+    window next to A's first window while each half is still a single window, then growing each half.
+    """
+    tree = binarize(node)
+    steps: list[tuple[str, str, str]] = []
+
+    def walk(t: dict) -> None:
+        if "class" in t:
+            return
+        first_half, second_half = t["children"]
+        steps.append((first_leaf(second_half), first_leaf(first_half), t.get("split", "columns")))
+        walk(first_half)
+        walk(second_half)
+
+    walk(tree)
+    return first_leaf(tree), steps
+
+
+def build_feasible(node: dict, area: tuple[int, int, int, int], width_multiplier: float) -> bool:
+    """dwindle picks the split direction from the cell's shape (w > h * split_width_multiplier means side
+    by side), so a profile asking for rows in a wide cell cannot be built by inserting windows."""
+    start, steps = build_steps(node)
+    boxes = {start: area}
+    for new, target, split in steps:
+        x, y, w, h = boxes[target]
+        side_by_side = w > h * width_multiplier
+        if side_by_side != (split == "columns"):
+            return False
+        if side_by_side:
+            boxes[target], boxes[new] = (x, y, w / 2, h), (x + w / 2, y, w / 2, h)
+        else:
+            boxes[target], boxes[new] = (x, y, w, h / 2), (x, y + h / 2, w, h / 2)
+    return True
+
+
 def tiled_on(workspace: str) -> list[dict]:
     live = [
         c
         for c in clients()
         if on_workspace(c, workspace) and c.get("mapped") and not c.get("floating") and not c.get("hidden")
     ]
-    live.sort(key=lambda c: slot_key(c["at"]))
+    live.sort(key=lambda c: (c["at"][0], c["at"][1]))
     return live
 
 
@@ -514,86 +623,169 @@ def cursor_position() -> tuple[int, int] | None:
     return int(data["x"]), int(data["y"])
 
 
-def reorder_workspace(workspace: str, node: dict, area: tuple[int, int, int, int], verbose: bool) -> str:
-    """Put the windows of a built-in-layout workspace into profile order.
+def dwindle_option(name: str, default):
+    data = hyprctl_json("getoption", f"dwindle:{name}")
+    if not isinstance(data, dict):
+        return default
+    for key in ("int", "float", "bool"):
+        if key in data:
+            return data[key]
+    return default
 
-    A built-in layout decides where a new window goes by itself (dwindle splits the window nearest the
-    cursor), so a workspace whose windows arrive at different times ends up in an order nobody chose.
-    The windows are swapped into profile order with `hl.dsp.window.swap({ window, target })`, which
-    does not move focus or switch the visible workspace; it only warps the cursor, which is put back.
 
-    Returns "ok" (already in order), "reordered", "incomplete" (a profile window is missing),
-    "foreign" (windows outside the profile are there, so the order is the user's business) or "failed".
+def as_rects(windows: list[dict]) -> list[tuple[str, tuple[int, int, int, int]]]:
+    return [(c.get("class"), (c["at"][0], c["at"][1], c["size"][0], c["size"][1])) for c in windows]
+
+
+def rebuild_workspace(workspace: str, node: dict, live: list[dict], area: tuple[int, int, int, int]) -> str:
+    """Make dwindle rebuild a workspace's tree in profile shape, without focus or switching workspaces.
+
+    A window that moves onto a dwindle workspace that has no focused window splits the window nearest the
+    cursor (use_active_for_splits; DwindleAlgorithm.cpp, Hyprland 0.56.2). So every window but the first
+    is parked on a hidden special workspace and moved back one by one, with the cursor put on the window
+    it has to split. The cursor and the keyboard focus are put back afterwards; a parked window is always
+    returned, even when a step fails.
     """
-    desired = desired_order(node, area)
-    live = tiled_on(workspace)
-    current = [c.get("class") for c in live]
-    if any(klass not in desired for klass in current):
-        return "foreign"
-    if sorted(current) != sorted(desired):
-        return "incomplete"
-    swaps = plan_swaps(current, desired)
-    if not swaps:
-        return "ok"
+    if not dwindle_option("use_active_for_splits", 1):
+        return "unsupported"
+    force_split = dwindle_option("force_split", 0)
+    smart_split = dwindle_option("smart_split", 0)
+    if force_split == 1 and not smart_split:
+        return "unsupported"  # new windows always go first; the plan puts them second
+    if not build_feasible(node, area, float(dwindle_option("split_width_multiplier", 1.0))):
+        return "unsupported"
+    active = hyprctl_json("activewindow") or {}
+    if active.get("workspace") and on_workspace(active, workspace):
+        return "busy"  # with a focused window there, dwindle splits that window, not the cursor's
 
+    start, steps = build_steps(node)
+    address = {c.get("class"): norm_address(str(c["address"])) for c in live}
     cursor = cursor_position()
-    addresses = [norm_address(str(c["address"])) for c in live]
-    for i, j in swaps:
+    focused = norm_address(str(active.get("address") or "")) if active.get("address") else None
+    parked: list[str] = []
+    ok = True
+    try:
+        for klass, addr in address.items():
+            if klass == start:
+                continue
+            if not move_window("address:" + addr, PARK, timeout=5):
+                ok = False
+                return "failed"
+            parked.append(addr)
+        for new, target, split in steps:
+            cell = client_by_address(address[target])
+            if not cell:
+                ok = False
+                return "failed"
+            (x, y), (w, h) = cell["at"], cell["size"]
+            px, py = (x + 0.85 * w, y + 0.5 * h) if split == "columns" else (x + 0.5 * w, y + 0.85 * h)
+            dispatch(f"hl.dsp.cursor.move({{ x = {int(px)}, y = {int(py)} }})")
+            if not move_window("address:" + address[new], workspace, timeout=5):
+                ok = False
+                return "failed"
+            parked.remove(address[new])
+            time.sleep(0.15)
+    finally:
+        for addr in parked:
+            move_window("address:" + addr, workspace, timeout=5)
+        if cursor:
+            dispatch(f"hl.dsp.cursor.move({{ x = {cursor[0]}, y = {cursor[1]} }})")
+        now = norm_address(str((hyprctl_json("activewindow") or {}).get("address") or ""))
+        if focused and now != focused:
+            dispatch(f'hl.dsp.focus({{ window = "address:{focused}" }})')
+    time.sleep(0.3)
+    return "rebuilt" if ok and classify(as_rects(tiled_on(workspace)), node, area) == "ok" else "failed"
+
+
+def arrange_workspace(workspace: str, node: dict, area: tuple[int, int, int, int], verbose: bool) -> str:
+    """Bring a built-in-layout workspace to its profile tree: windows in the right cells, right tree shape.
+
+    Compares cell geometry, not reading order: [[a | b] | c] and [a | [b | c]] read the same left to right
+    and differ only in which window spans a half. Right cells with the wrong windows are fixed with
+    `hl.dsp.window.swap`; a wrong tree is rebuilt (rebuild_workspace). Returns the classify() verdict, or
+    "swapped", "rebuilt", "busy", "unsupported" or "failed" after acting.
+    """
+    live = tiled_on(workspace)
+    rects = as_rects(live)
+    verdict = classify(rects, node, area)
+    if verdict in ("ok", "incomplete", "foreign"):
+        return verdict
+    before = " | ".join(klass for klass, _ in rects)
+
+    if verdict == "rebuild":
+        state = rebuild_workspace(workspace, node, live, area)
+        detail = ", ".join(f"{k} {r[2]}x{r[3]}@{r[0]}" for k, r in rects)
+        log_line(f"rebuild ws {workspace}: {state} (was {detail})", verbose)
+        return state
+
+    expected = natural_boxes(node, area)
+    slots = match_slots(rects, expected)
+    current = [rects[i][0] for i in slots]
+    desired = [klass for klass, _ in expected]
+    addresses = [norm_address(str(live[i]["address"])) for i in slots]
+    cursor = cursor_position()
+    for i, j in plan_swaps(current, desired):
         dispatch(f'hl.dsp.window.swap({{ window = "address:{addresses[j]}", target = "address:{addresses[i]}" }})')
         addresses[i], addresses[j] = addresses[j], addresses[i]
     if cursor:
         dispatch(f"hl.dsp.cursor.move({{ x = {cursor[0]}, y = {cursor[1]} }})")
-
     time.sleep(0.3)
-    after = [c.get("class") for c in tiled_on(workspace)]
-    if after == desired:
-        log_line(f"reordered ws {workspace}: {' | '.join(current)} -> {' | '.join(after)}", verbose)
-        return "reordered"
-    log_line(f"reorder failed on ws {workspace}: wanted {' | '.join(desired)}, got {' | '.join(after)}", verbose)
-    return "failed"
+    after = classify(as_rects(tiled_on(workspace)), node, area)
+    log_line(f"swap ws {workspace}: {before} -> {'ok' if after == 'ok' else 'FAILED: ' + after}", verbose)
+    return "swapped" if after == "ok" else "failed"
 
 
 def reconcile_arrivals(
     profile: dict, wanted: dict[str, dict], launched: set[str], watch: float, cap: float, log, verbose: bool
 ) -> tuple[int, int]:
-    """Place profile windows that show up after the first pass and keep built-in-layout workspaces in order.
+    """Place profile windows that show up after the first pass and keep built-in-layout workspaces in shape.
 
     Some apps (Discord) map an updater window first and their real window much later. The window rule
-    already puts every such window on its workspace; this watch moves any that slipped through and, on
-    workspaces that run a built-in layout, swaps the windows back into profile order after every
-    arrival or departure, because the layout itself places a late window wherever the cursor happens to
-    be. When this run launched a window of such a workspace, the watch holds for the full `cap`: the real
-    window can arrive long after a quiet updater, and the order has to be fixed then too.
+    already puts every such window on its workspace; this watch moves any that slipped through and, on a
+    workspace that runs a built-in layout, brings the tree back to the profile's (arrange_workspace) after
+    every arrival or departure, because dwindle puts a late window next to whichever window the cursor is
+    nearest. When this run launched a window of such a workspace, the watch holds for the full `cap`: the
+    real window can arrive long after a quiet updater.
 
-    Returns (windows moved, workspaces reordered).
+    Only workspaces this run is assembling are touched: one whose window this run launched, or one a
+    window arrived on or left during the watch. A plain `apply` on a settled desktop leaves a manually
+    resized dwindle workspace alone.
+
+    Returns (windows moved, workspaces arranged).
     """
-    moved = reordered = 0
+    moved = arranged = 0
     start = time.monotonic()
     deadline = start + cap
     unmanaged = unmanaged_workspaces(profile)
     area = work_area()
-    order_classes = {leaf["class"] for node in unmanaged.values() for leaf in leaves(node)}
-    hold_until = deadline if launched & order_classes else start
+    workspace_of = {leaf["class"]: ws for ws, node in unmanaged.items() for leaf in leaves(node)}
+    hold_until = deadline if launched & set(workspace_of) else start
     known = {norm_address(str(c.get("address") or "")): c.get("class") for c in clients()}
+    assembling = {workspace_of[klass] for klass in launched if klass in workspace_of}
 
     def settle() -> bool:
-        nonlocal reordered
-        incomplete = False
-        for workspace, node in unmanaged.items():
-            state = reorder_workspace(workspace, node, area, verbose)
-            if state == "reordered":
-                reordered += 1
-            elif state == "incomplete":
-                incomplete = True
-        return incomplete
+        nonlocal arranged
+        waiting = False
+        for workspace in sorted(assembling):
+            state = arrange_workspace(workspace, unmanaged[workspace], area, verbose)
+            if state in ("swapped", "rebuilt"):
+                arranged += 1
+            elif state in ("incomplete", "busy"):
+                waiting = True
+        return waiting
 
     pending = settle()
     keep_going = lambda: pending or time.monotonic() < hold_until  # noqa: E731
     for kind, selector, klass in watch_events(deadline, log, idle=watch, keep_going=keep_going):
+        if kind == "idle":
+            if pending:
+                pending = settle()
+            continue
         address = norm_address(selector)
         if kind == "closewindow":
             klass = known.pop(address, None)
-            if klass in order_classes:
+            if klass in workspace_of:
+                assembling.add(workspace_of[klass])
                 time.sleep(0.5)
                 pending = settle()
             continue
@@ -607,10 +799,11 @@ def reconcile_arrivals(
                 if move_window(selector, spec["workspace"], timeout=15):
                     moved += 1
                     log_line(f"late arrival placed: {klass} -> {spec['workspace']}", verbose)
-        if klass in order_classes:
+        if klass in workspace_of:
+            assembling.add(workspace_of[klass])
             time.sleep(0.5)
             pending = settle()
-    return moved, reordered
+    return moved, arranged
 
 
 def cmd_apply(args) -> int:
@@ -750,7 +943,7 @@ def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) 
     report_geometry(profile, active_mode, only_classes={klass for klass, _ in placed})
 
     if args.watch > 0:
-        late, reordered = reconcile_arrivals(
+        late, arranged = reconcile_arrivals(
             profile,
             wanted,
             set(missing),
@@ -761,8 +954,8 @@ def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) 
         )
         if late and not args.quiet:
             print(f"placed {late} late arrival(s)")
-        if reordered and not args.quiet:
-            print(f"put {reordered} workspace(s) back into profile order")
+        if arranged and not args.quiet:
+            print(f"brought {arranged} built-in-layout workspace(s) back to the profile tree")
 
     for name, workspace in placed:
         print(f"placed {name} -> {workspace}")
@@ -984,10 +1177,14 @@ def cmd_save(args) -> int:
 
 
 def cmd_order(args) -> int:
-    """Put built-in-layout workspaces into profile order once, without launching anything."""
+    """Bring built-in-layout workspaces to their profile tree once, without launching anything.
+
+    `--check` only reports. Without it a wrong tree is rebuilt, which resets that workspace's split ratios
+    to halves: on a dwindle workspace the ratios are otherwise the user's.
+    """
     profile = load_profile()
     if mode() == "internal":
-        print("internal panel: workspaces scroll, there is no order to fix")
+        print("internal panel: workspaces scroll, there is no tree to fix")
         return 0
     area = work_area()
     unmanaged = unmanaged_workspaces(profile)
@@ -998,9 +1195,12 @@ def cmd_order(args) -> int:
         return 0
     status = 0
     for workspace, node in sorted(unmanaged.items(), key=lambda kv: float(kv[0])):
-        state = reorder_workspace(workspace, node, area, args.verbose)
+        if args.check:
+            state = classify(as_rects(tiled_on(workspace)), node, area)
+        else:
+            state = arrange_workspace(workspace, node, area, args.verbose)
         print(f"ws {workspace}: {state}")
-        if state == "failed":
+        if state in ("failed", "rebuild", "swap", "unsupported"):
             status = 1
     return status
 
@@ -1043,8 +1243,9 @@ def main(argv=None) -> int:
     save_parser = sub.add_parser("save", help="overwrite a workspace node from the live session")
     save_parser.add_argument("workspace", nargs="?", help="workspace id (default: the focused one)")
     sub.add_parser("list", help="one line per workspace")
-    order_parser = sub.add_parser("order", help="swap built-in-layout workspaces back into profile order")
+    order_parser = sub.add_parser("order", help="bring built-in-layout workspaces to their profile tree")
     order_parser.add_argument("workspace", nargs="?", help="only this workspace")
+    order_parser.add_argument("--check", action="store_true", help="report only, move nothing")
     order_parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args(argv)

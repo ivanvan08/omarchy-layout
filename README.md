@@ -153,7 +153,8 @@ omarchy-layout status               # each profile window: running or not, on wh
 omarchy-layout status --compare     # adds expected vs actual rects and the worst delta
 omarchy-layout save [workspace]     # overwrite that workspace's node from the live session
 omarchy-layout list                 # one line per workspace
-omarchy-layout order [workspace]    # swap built-in-layout workspaces back into profile order
+omarchy-layout order [workspace]    # bring built-in-layout workspaces to their profile tree
+omarchy-layout order --check        # report only, move nothing
 ```
 
 `apply` does five things, and only the first one launches anything:
@@ -165,8 +166,8 @@ omarchy-layout order [workspace]    # swap built-in-layout workspaces back into 
    `--watch-cap`) and places **late arrivals**: some apps, Electron ones especially, map a splash
    window first and remap the real one afterwards, and a remap is a fresh event on whatever workspace
    is current at that moment. Without this phase such a window stays wherever it happened to open,
-4. keeps **built-in-layout workspaces in profile order** (see below) after every arrival or departure
-   during that watch,
+4. keeps **built-in-layout workspaces in their profile tree** (see below) after every arrival or
+   departure during that watch,
 5. compiles the profile and re-asserts the workspace rules, then reports the geometry diff.
 
 A lock file (`~/.local/state/omarchy/layout/apply.lock`) makes concurrent runs impossible: `apply` is
@@ -315,26 +316,42 @@ Such a workspace is still launched and targeted by `apply` (the windows go to th
 order), but its geometry belongs to `dwindle` and the layout provider keeps its hands off it. Any
 built-in layout name works, `scrolling` included.
 
-### Order on a built-in-layout workspace
+### Tree shape on a built-in-layout workspace
 
-A built-in layout decides by itself where a new window goes. With Hyprland's defaults
-(`dwindle:use_active_for_splits = true`) a window that maps on a workspace that is not on screen splits
-the window **nearest the cursor** (`DwindleAlgorithm.cpp`, Hyprland 0.56.2), so when the apps of one
-workspace arrive at different times, which is normal at login, the order is decided by wherever the
-mouse happened to be.
+A built-in layout decides by itself where a new window goes. On dwindle with Hyprland's defaults
+(`dwindle:use_active_for_splits = true`) a window that lands on a workspace with no focused window
+splits the window **nearest the cursor**, and `dwindle:force_split` decides which side it takes
+(`DwindleAlgorithm.cpp`, Hyprland 0.56.2). When the apps of one workspace arrive at different times,
+which is normal at login, the tree is decided by wherever the mouse happened to be.
 
-`apply` fixes that: after every arrival or departure on such a workspace it compares the windows'
-reading order (left to right, then top to bottom) with the profile's and swaps them back with
-`hl.dsp.window.swap({ window, target })`. That dispatcher changes neither focus nor the visible
-workspace; it warps the cursor, which `apply` puts back. When the run launched one of the workspace's
-windows itself, the watch holds for the whole `--watch-cap`, because an app with an updater window
-(Discord) maps its real window long after the updater went quiet.
+The tree matters, not only the order: `[[a | b] | c]` and `[a | [b | c]]` both read a, b, c left to
+right, but in the first `c` spans a half and in the second `a` does. So `apply` compares **cell
+geometry**: it computes the cells dwindle makes for the profile tree (every split at one half, n
+children nesting to the right) on the live work area and checks which window sits in which cell,
+within 32 px.
 
-The order is enforced only while every window on the workspace belongs to the profile: a workspace with
-an extra window of yours is left as you arranged it. `omarchy-layout order` runs the same check once,
-on demand; it never launches anything and prints `ok`, `reordered`, `incomplete`, `foreign` or
-`failed` per workspace. The order is a sequence, not sizes: the cells are whatever the built-in layout
-makes of it.
+- Right cells, wrong windows: they are swapped with `hl.dsp.window.swap({ window, target })`.
+- Wrong tree: it is rebuilt. Every window but the first is parked on a hidden special workspace
+  (`special:omarchy-layout-park`) and moved back one by one, with the cursor put on the window it has
+  to split. Neither focus nor the visible workspace changes; the cursor and keyboard focus are put
+  back, and a parked window is always returned, even when a step fails.
+
+The rebuild needs `dwindle:use_active_for_splits = true` (otherwise dwindle ignores the cursor),
+`force_split` 0 or 2 (1 puts every new window first), no focused window on that workspace (dwindle then
+splits the focused one; the run waits and retries) and a profile whose splits match the cell shapes
+(dwindle splits a wide cell side by side, so `rows` in a wide cell cannot be built). Otherwise it
+reports `unsupported` or `busy` and moves nothing.
+
+Only a workspace the run is assembling is touched: one whose window this run launched, or one a window
+arrived on or left during the watch. A plain `apply` on a settled desktop does not undo your resizing.
+When the run launched one of the workspace's windows itself, the watch holds for the whole
+`--watch-cap`, because an app with an updater window (Discord) maps its real window long after the
+updater went quiet. A workspace with a window outside the profile is left as you arranged it.
+
+`omarchy-layout order` runs the same check once, on demand, and prints `ok`, `swapped`, `rebuilt`,
+`incomplete`, `foreign`, `busy`, `unsupported` or `failed` per workspace. It never launches anything,
+and a rebuild resets that workspace's split ratios to halves. `omarchy-layout order --check` only
+reports (`ok`, `swap`, `rebuild`, `incomplete`, `foreign`) and exits 1 when something would change.
 
 The layout does learn from a manual geometry change when the host delivers one (`target.box` differing
 from the box the layout placed is turned into a new split ratio, and a single-window workspace keeps
@@ -370,9 +387,10 @@ cell without shifting the others, a window outside the profile is placed to the 
 block without overlapping, an empty workspace is a no-op, a rule is registered per profile workspace,
 and in internal mode the workspaces fall back to `scrolling` with no cells placed.
 
-The swap planning that restores profile order on a built-in-layout workspace has its own hermetic
-test: reading order of nested trees, the late-window-in-the-middle case, and every permutation of four
-windows sorted in at most three swaps.
+The comparison of a built-in-layout workspace with its profile tree has its own hermetic test: the
+wrong-tree geometry measured live (it reads in profile order and still needs a rebuild), the right tree,
+right cells with wrong windows, a missing and an extra window, the insertion plan and its simulated
+cells, which split shapes dwindle can build, and the swap planning over every permutation of four.
 
 ```sh
 python3 -m unittest tests/test_order.py
