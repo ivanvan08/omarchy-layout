@@ -113,7 +113,8 @@ Schema:
 ```
 
 - **Leaf**: `app` (label for reporting), `class` (the value Hyprland reports for the window, see
-  `hyprctl clients -j`), `exec` (shell command to start it).
+  `hyprctl clients -j`), `exec` (shell command to start it), optional `"launch_first": true` (started
+  before the other apps, for a slow starter such as Discord with its updater).
 - **Internal node**: `split` (`"columns"` or `"rows"`), optional `ratios` (each share of the
   remaining space, equal when omitted), `children` in left-to-right / top-to-bottom order.
 - **Top level**: `version`, optional `scratchpad` (list of leaves launched into the scratchpad and
@@ -130,15 +131,21 @@ Placement rules:
   profile works on a different monitor or scaling.
 - `scratchpad` entries are tracked by the address of the window this tool launched (state file
   `scratchpad.json`), not by class, because a terminal-running app shares its class with every other
-  terminal of the same emulator.
+  terminal of the same emulator. Give an entry a class of its own and `"rule": true` (for herdr:
+  `uwsm-app -- ghostty --class=org.omarchy.herdr -e herdr`) and a window rule sends it to the scratchpad
+  before it is ever shown; an `org.omarchy.*` class keeps Omarchy's `terminal` tag
+  (`default/hypr/apps/terminals.lua`).
 - Every regular leaf also gets a **window rule** at config load:
   `hl.window_rule({ match = { class = "^<class>$" }, workspace = "<N> silent" })`. The compositor then
   puts the window on its workspace the moment it maps, however late that is, and without moving
   focus. This is what catches apps that map a splash or updater window first and their real window
   much later (Discord): launch-and-move from the CLI would only ever catch the first window. The
   side effect is that **any** new window of that class opens on that workspace; a leaf opts out with
-  `"rule": false`. Scratchpad entries never get a rule, since their class is shared. Rules are
-  registered when the config loads, so a profile edit takes effect after `hyprctl reload`.
+  `"rule": false`. Scratchpad entries get a rule only with `"rule": true`. Rules are registered when the
+  config loads, so a profile edit takes effect after `hyprctl reload`. Rules that send a window somewhere
+  hidden (the park below, the scratchpad) also set `no_initial_focus` and `focus_on_activate = false`: an
+  app Hyprland launched gets an activation token, and a GTK app (ghostty) uses it on start, which showed
+  the scratchpad and focused the window despite `silent`.
 
 ## CLI
 
@@ -192,10 +199,11 @@ Environment overrides:
 | `OMARCHY_LAYOUT_LAUNCH_TIMEOUT` | default for `--timeout` |
 | `OMARCHY_LAYOUT_WATCH` | default for `--watch` (seconds of quiet before the late-arrival watch stops) |
 | `OMARCHY_LAYOUT_WATCH_CAP` | default for `--watch-cap` (hard limit for that watch) |
+| `OMARCHY_LAYOUT_PARK_CAP` | how long a parked workspace waits for its slowest window, seconds (default 300) |
 
 State lives in `~/.local/state/omarchy/layout/`: `profile.lua` (compiled from the profile JSON),
-`scratchpad.json`, `last-apply` (ISO timestamp written by every run, including the automatic one) and
-`log` (one line per run).
+`scratchpad.json`, `assembled-<session>-<workspace>` (see "Assembly out of sight"), `last-apply` (ISO
+timestamp written by every run, including the automatic one) and `log` (one line per run).
 
 ## How it is wired to Hyprland
 
@@ -332,15 +340,15 @@ within 32 px.
 
 - Right cells, wrong windows: they are swapped with `hl.dsp.window.swap({ window, target })`.
 - Wrong tree: it is rebuilt. Every window but the first is parked on a hidden special workspace
-  (`special:omarchy-layout-park`) and moved back one by one, with the cursor put on the window it has
-  to split. Neither focus nor the visible workspace changes; the cursor and keyboard focus are put
-  back, and a parked window is always returned, even when a step fails.
+  (`special:omarchy-layout-park`) and moved back one by one in build order. Before each move the window
+  to split is made dwindle's target: the cursor is put inside it when it is not there already, and when
+  you have focus on that workspace, focus goes to it (dwindle splits the focused window then). Cursor and
+  focus are put back, and a parked window is always returned, even when a step fails.
 
-The rebuild needs `dwindle:use_active_for_splits = true` (otherwise dwindle ignores the cursor),
-`force_split` 0 or 2 (1 puts every new window first), no focused window on that workspace (dwindle then
-splits the focused one; the run waits and retries) and a profile whose splits match the cell shapes
-(dwindle splits a wide cell side by side, so `rows` in a wide cell cannot be built). Otherwise it
-reports `unsupported` or `busy` and moves nothing.
+Building needs `dwindle:use_active_for_splits = true` (otherwise dwindle ignores cursor and focus),
+`force_split` 0 or 2 (1 puts every new window first) and a profile whose splits match the cell shapes
+(dwindle splits a wide cell side by side, so `rows` in a wide cell cannot be built). Otherwise it reports
+`unsupported` and moves nothing.
 
 Only a workspace the run is assembling is touched: one whose window this run launched, or one a window
 arrived on or left during the watch. A plain `apply` on a settled desktop does not undo your resizing.
@@ -348,10 +356,26 @@ When the run launched one of the workspace's windows itself, the watch holds for
 `--watch-cap`, because an app with an updater window (Discord) maps its real window long after the
 updater went quiet. A workspace with a window outside the profile is left as you arranged it.
 
+### Assembly out of sight
+
+At login a built-in-layout workspace is not built where you can see it. Until `apply` has assembled it
+in this Hyprland session, the window rules of its apps send them to the hidden
+`special:omarchy-layout-park` (silently, without focus), and the rules to the workspace itself are
+registered disabled. Once every leaf has its window there, `apply` moves them in in build order, so
+dwindle builds the profile tree; the screen stays on whatever workspace you are on, and an updater or
+splash window (Discord's floats: fixed size, no frame) never takes a tile. Then it switches the rules
+over through `hyprctl eval` (it shares the config's Lua state; the rule objects are in the global
+`omarchy_layout_rules`) and writes `assembled-<HYPRLAND_INSTANCE_SIGNATURE>-<workspace>`, so a config
+reload in the same session keeps the normal rules and later windows of those apps open on the workspace
+as usual. A slow app does not hold the workspace hidden forever: after `OMARCHY_LAYOUT_PARK_CAP` seconds
+(default 300) whatever has arrived is moved in, and a run that ends for any reason moves parked windows
+in before it exits. `omarchy-layout order` does the same at once.
+
 `omarchy-layout order` runs the same check once, on demand, and prints `ok`, `swapped`, `rebuilt`,
-`incomplete`, `foreign`, `busy`, `unsupported` or `failed` per workspace. It never launches anything,
-and a rebuild resets that workspace's split ratios to halves. `omarchy-layout order --check` only
-reports (`ok`, `swap`, `rebuild`, `incomplete`, `foreign`) and exits 1 when something would change.
+`assembled`, `flushed`, `incomplete`, `foreign`, `unsupported` or `failed` per workspace. It never
+launches anything, and a rebuild resets that workspace's split ratios to halves.
+`omarchy-layout order --check` only reports (`ok`, `swap`, `rebuild`, `incomplete`, `foreign`) and
+exits 1 when something would change.
 
 The layout does learn from a manual geometry change when the host delivers one (`target.box` differing
 from the box the layout placed is turned into a new split ratio, and a single-window workspace keeps

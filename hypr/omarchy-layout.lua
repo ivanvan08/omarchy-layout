@@ -375,12 +375,26 @@ for workspace, node in pairs((profile or {}).workspaces or {}) do
   hl.workspace_rule({ workspace = tostring(workspace), layout = layout })
 end
 
--- Send every profile window to its workspace at map time. Launch-and-move from the CLI cannot do this
--- reliably: an app that shows a splash or updater window first (Discord) maps its real window much
--- later, on whatever workspace is current then. A compositor rule has no timing to lose.
--- `silent` keeps focus where the user is. Scratchpad entries get no rule: their class is shared with
--- every other window of the same terminal, which would all be dragged into the scratchpad.
--- A leaf can opt out with "rule": false.
+-- Send every profile window to its workspace at map time, `silent` so focus and the visible workspace
+-- stay where the user is. A compositor rule has no timing to lose, unlike launch-and-move.
+--
+-- Workspaces that run a built-in layout (`"layout": "dwindle"`) are assembled out of sight first: until
+-- `omarchy-layout apply` has put this session's windows in place, their rules send them to a hidden
+-- special workspace, and apply moves them in in the order the layout needs. dwindle builds its tree
+-- from arrival order, and apps arrive whenever they are ready (Discord after its updater window), so
+-- placing them directly would leave the tree to chance. apply then switches the rules over and leaves a
+-- per-session flag, so a config reload does not hide windows again.
+--
+-- Scratchpad entries get a rule only with "rule": true, for a class of their own: a shared terminal
+-- class would drag every terminal into the scratchpad. A leaf can opt out with "rule": false.
+--
+-- Windows sent somewhere hidden (the park, the scratchpad) also must not take focus: an app launched by
+-- Hyprland gets an activation token, and a GTK app such as ghostty uses it on start, which made Hyprland
+-- show the special workspace and focus the window although the rule said `silent` (measured on 0.56.2).
+local HIDDEN = { no_initial_focus = true, focus_on_activate = false }
+local PARK = "special:omarchy-layout-park"
+local SESSION = os.getenv("HYPRLAND_INSTANCE_SIGNATURE") or "unknown"
+
 local function regex_escape(text)
   return (text:gsub("[%^%$%(%)%.%[%]%*%+%-%?%{%}%|\\]", "\\%0"))
 end
@@ -396,13 +410,60 @@ local function leaves_of(node, out)
   return out
 end
 
+local function assembled(workspace)
+  local handle = io.open(string.format("%s/assembled-%s-%s", STATE_DIR, SESSION, workspace), "r")
+  if handle then
+    handle:close()
+    return true
+  end
+  return false
+end
+
+local function add_rule(spec)
+  local ok, rule = pcall(hl.window_rule, spec)
+  return ok and rule or nil
+end
+
+-- Global on purpose: `hyprctl eval` runs in this same Lua state, which is how apply switches the rules of
+-- an assembled workspace from park to normal without a config reload.
+omarchy_layout_rules = { park = {}, normal = {} }
+
 for workspace, node in pairs((profile or {}).workspaces or {}) do
+  local ws = tostring(workspace)
+  local hidden = (node or {}).layout ~= nil and (profile or {}).mode ~= "internal" and not assembled(ws)
+  omarchy_layout_rules.park[ws], omarchy_layout_rules.normal[ws] = {}, {}
   for _, leaf in ipairs(leaves_of(node or {}, {})) do
     if leaf.rule ~= false then
-      pcall(hl.window_rule, {
-        match = { class = "^" .. regex_escape(leaf.class) .. "$" },
-        workspace = tostring(workspace) .. " silent",
+      local match = { class = "^" .. regex_escape(leaf.class) .. "$" }
+      local normal = add_rule({
+        name = "omarchy-layout/" .. leaf.class,
+        enabled = not hidden,
+        match = match,
+        workspace = ws .. " silent",
       })
+      table.insert(omarchy_layout_rules.normal[ws], normal)
+      if hidden then
+        local park = add_rule({
+          name = "omarchy-layout/park/" .. leaf.class,
+          match = match,
+          workspace = PARK .. " silent",
+          no_initial_focus = HIDDEN.no_initial_focus,
+          focus_on_activate = HIDDEN.focus_on_activate,
+        })
+        table.insert(omarchy_layout_rules.park[ws], park)
+      end
     end
+  end
+end
+
+for _, entry in ipairs((profile or {}).scratchpad or {}) do
+  if entry.rule == true and entry.class then
+    add_rule({
+      name = "omarchy-layout/scratchpad/" .. entry.class,
+      match = { class = "^" .. regex_escape(entry.class) .. "$" },
+      workspace = "special:scratchpad silent",
+      no_initial_focus = HIDDEN.no_initial_focus,
+      focus_on_activate = HIDDEN.focus_on_activate,
+    })
   end
 end

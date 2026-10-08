@@ -473,6 +473,9 @@ def unmanaged_workspaces(profile: dict) -> dict[str, dict]:
 
 
 PARK = "special:omarchy-layout-park"
+# How long a parked workspace may wait for its slowest window (Discord's updater can take minutes on a
+# release day) before whatever has arrived is moved in anyway.
+PARK_CAP = float(os.environ.get("OMARCHY_LAYOUT_PARK_CAP", "300"))
 # Pixel tolerance for "this window sits in that cell". Rounding and gap arithmetic differ by a few px;
 # a wrong tree differs by a whole cell, hundreds of px.
 SHAPE_TOLERANCE = 32
@@ -637,64 +640,162 @@ def as_rects(windows: list[dict]) -> list[tuple[str, tuple[int, int, int, int]]]
     return [(c.get("class"), (c["at"][0], c["at"][1], c["size"][0], c["size"][1])) for c in windows]
 
 
-def rebuild_workspace(workspace: str, node: dict, live: list[dict], area: tuple[int, int, int, int]) -> str:
-    """Make dwindle rebuild a workspace's tree in profile shape, without focus or switching workspaces.
-
-    A window that moves onto a dwindle workspace that has no focused window splits the window nearest the
-    cursor (use_active_for_splits; DwindleAlgorithm.cpp, Hyprland 0.56.2). So every window but the first
-    is parked on a hidden special workspace and moved back one by one, with the cursor put on the window
-    it has to split. The cursor and the keyboard focus are put back afterwards; a parked window is always
-    returned, even when a step fails.
-    """
+def dwindle_unbuildable(node: dict, area: tuple[int, int, int, int]) -> str | None:
+    """Why the dwindle options make the insertion plan unbuildable, or None when it can be built."""
     if not dwindle_option("use_active_for_splits", 1):
-        return "unsupported"
-    force_split = dwindle_option("force_split", 0)
-    smart_split = dwindle_option("smart_split", 0)
-    if force_split == 1 and not smart_split:
-        return "unsupported"  # new windows always go first; the plan puts them second
+        return "dwindle:use_active_for_splits is off, so dwindle ignores both cursor and focus"
+    if dwindle_option("force_split", 0) == 1 and not dwindle_option("smart_split", 0):
+        return "dwindle:force_split = 1 puts every new window first; the plan puts them second"
     if not build_feasible(node, area, float(dwindle_option("split_width_multiplier", 1.0))):
-        return "unsupported"
-    active = hyprctl_json("activewindow") or {}
-    if active.get("workspace") and on_workspace(active, workspace):
-        return "busy"  # with a focused window there, dwindle splits that window, not the cursor's
+        return "a split in the profile does not match the cell shape dwindle splits along"
+    return None
 
+
+def insert_in_order(workspace: str, node: dict, address: dict[str, str]) -> bool:
+    """Move a profile's windows onto a dwindle workspace in the order that builds the profile tree.
+
+    `address` maps every leaf class to its window; the windows are anywhere except on `workspace` (the
+    park, typically), apart from the tree's first window, which may already be there. A window that lands
+    on a dwindle workspace splits the focused window when there is one on that workspace, otherwise the
+    window nearest the cursor (use_active_for_splits; DwindleAlgorithm.cpp:83-105, Hyprland 0.56.2), and
+    force_split picks its side (:211-227). So before each move the window to split is made the target: the
+    cursor is put inside it when it is not there already, and when the user has focus on that workspace,
+    focus goes to it. Cursor and focus are put back afterwards. Returns False when a move did not land.
+    """
     start, steps = build_steps(node)
-    address = {c.get("class"): norm_address(str(c["address"])) for c in live}
     cursor = cursor_position()
+    active = hyprctl_json("activewindow") or {}
     focused = norm_address(str(active.get("address") or "")) if active.get("address") else None
-    parked: list[str] = []
-    ok = True
+    warped = refocused = False
     try:
-        for klass, addr in address.items():
-            if klass == start:
-                continue
-            if not move_window("address:" + addr, PARK, timeout=5):
-                ok = False
-                return "failed"
-            parked.append(addr)
+        if not move_window("address:" + address[start], workspace, timeout=5):
+            return False
         for new, target, split in steps:
             cell = client_by_address(address[target])
             if not cell:
-                ok = False
-                return "failed"
+                return False
             (x, y), (w, h) = cell["at"], cell["size"]
-            px, py = (x + 0.85 * w, y + 0.5 * h) if split == "columns" else (x + 0.5 * w, y + 0.85 * h)
-            dispatch(f"hl.dsp.cursor.move({{ x = {int(px)}, y = {int(py)} }})")
+            here = cursor_position()
+            if not (here and x <= here[0] < x + w and y <= here[1] < y + h):
+                px, py = (x + 0.85 * w, y + 0.5 * h) if split == "columns" else (x + 0.5 * w, y + 0.85 * h)
+                dispatch(f"hl.dsp.cursor.move({{ x = {int(px)}, y = {int(py)} }})")
+                warped = True
+            now = hyprctl_json("activewindow") or {}
+            if now.get("workspace") and on_workspace(now, workspace):
+                if norm_address(str(now.get("address") or "")) != address[target]:
+                    dispatch(f'hl.dsp.focus({{ window = "address:{address[target]}" }})')
+                    refocused = True
             if not move_window("address:" + address[new], workspace, timeout=5):
-                ok = False
-                return "failed"
-            parked.remove(address[new])
+                return False
             time.sleep(0.15)
+        return True
     finally:
-        for addr in parked:
-            move_window("address:" + addr, workspace, timeout=5)
-        if cursor:
+        if warped and cursor:
             dispatch(f"hl.dsp.cursor.move({{ x = {cursor[0]}, y = {cursor[1]} }})")
-        now = norm_address(str((hyprctl_json("activewindow") or {}).get("address") or ""))
-        if focused and now != focused:
+        if refocused and focused:
             dispatch(f'hl.dsp.focus({{ window = "address:{focused}" }})')
+
+
+def rebuild_workspace(workspace: str, node: dict, live: list[dict], area: tuple[int, int, int, int]) -> str:
+    """Make dwindle rebuild a workspace's tree in profile shape, without switching workspaces.
+
+    Every window but the tree's first is parked on a hidden special workspace and moved back in build order
+    (insert_in_order). A parked window is always returned, even when a step fails.
+    """
+    if dwindle_unbuildable(node, area):
+        return "unsupported"
+    start, _ = build_steps(node)
+    address = {c.get("class"): norm_address(str(c["address"])) for c in live}
+    ok = True
+    try:
+        for klass, addr in address.items():
+            if klass != start and not move_window("address:" + addr, PARK, timeout=5):
+                ok = False
+                break
+        ok = ok and insert_in_order(workspace, node, address)
+    finally:
+        for addr in address.values():
+            client = client_by_address(addr)
+            if client and on_workspace(client, PARK):
+                move_window("address:" + addr, workspace, timeout=5)
     time.sleep(0.3)
     return "rebuilt" if ok and classify(as_rects(tiled_on(workspace)), node, area) == "ok" else "failed"
+
+
+def assembled_flag(workspace: str) -> str:
+    return os.path.join(STATE_DIR, f"assembled-{INSTANCE}-{workspace}")
+
+
+def parking(workspace: str, node: dict, active_mode: str) -> bool:
+    """Whether this session's window rules still send the workspace's windows to the park.
+
+    Mirrors the module: a built-in-layout workspace, an external monitor, no assembled flag for this
+    Hyprland instance.
+    """
+    return bool(node.get("layout")) and active_mode != "internal" and not os.path.exists(assembled_flag(workspace))
+
+
+def finish_assembly(workspace: str, verbose: bool) -> None:
+    """Switch the workspace's window rules from the park to the workspace itself, for the rest of the
+    session: through `hyprctl eval`, which shares the config's Lua state, and through the flag the module
+    reads on a config reload."""
+    ws = workspace.replace('"', "")
+    eval_lua(
+        "local r = omarchy_layout_rules or { park = {}, normal = {} } "
+        f'for _, x in ipairs(r.park["{ws}"] or {{}}) do x:set_enabled(false) end '
+        f'for _, x in ipairs(r.normal["{ws}"] or {{}}) do x:set_enabled(true) end'
+    )
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(assembled_flag(workspace), "w") as handle:
+        handle.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+    log_line(f"ws {workspace}: rules switched from the park to the workspace", verbose)
+
+
+def profile_windows(workspace: str, node: dict) -> dict[str, dict]:
+    """Class -> window for the profile's leaves, wherever the window is: the park or the workspace."""
+    classes = {leaf["class"] for leaf in leaves(node)}
+    found: dict[str, dict] = {}
+    for client in clients():
+        klass = client.get("class")
+        if klass not in classes or klass in found:
+            continue
+        if not client.get("mapped") or client.get("floating") or client.get("hidden"):
+            continue  # an updater or splash window floats; it is not the window the cell is for
+        if on_workspace(client, PARK) or on_workspace(client, workspace):
+            found[klass] = client
+    return found
+
+
+def assemble_workspace(workspace: str, node: dict, area: tuple[int, int, int, int], verbose: bool, final: bool) -> str:
+    """Put a parked workspace together once all of its windows are there, then stop parking it.
+
+    Returns "waiting" until every leaf has its window (unless `final`), then "assembled", or "flushed" when
+    the tree could not be built: the windows are moved in in profile order and the layout does the rest.
+    Either way no window is left in the park, and the workspace's rules point at the workspace again.
+    """
+    found = profile_windows(workspace, node)
+    complete = len(found) == len(leaves(node))
+    if not complete and not final:
+        return "waiting"
+    try:
+        address = {klass: norm_address(str(c["address"])) for klass, c in found.items()}
+        reason = dwindle_unbuildable(node, area)
+        state = "flushed"
+        if complete and not reason:
+            for klass, client in found.items():
+                if on_workspace(client, workspace):
+                    move_window("address:" + address[klass], PARK, timeout=5)
+            if insert_in_order(workspace, node, address):
+                state = "assembled"
+        detail = reason or ("missing " + ", ".join(sorted({l["class"] for l in leaves(node)} - set(found))) if not complete else "")
+        log_line(f"assemble ws {workspace}: {state}" + (f" ({detail})" if detail else ""), verbose)
+        return state
+    finally:
+        classes = {leaf["class"] for leaf in leaves(node)}
+        for client in clients():
+            if client.get("class") in classes and on_workspace(client, PARK):
+                move_window("address:" + norm_address(str(client["address"])), workspace, timeout=5)
+        finish_assembly(workspace, verbose)
 
 
 def arrange_workspace(workspace: str, node: dict, area: tuple[int, int, int, int], verbose: bool) -> str:
@@ -703,7 +804,7 @@ def arrange_workspace(workspace: str, node: dict, area: tuple[int, int, int, int
     Compares cell geometry, not reading order: [[a | b] | c] and [a | [b | c]] read the same left to right
     and differ only in which window spans a half. Right cells with the wrong windows are fixed with
     `hl.dsp.window.swap`; a wrong tree is rebuilt (rebuild_workspace). Returns the classify() verdict, or
-    "swapped", "rebuilt", "busy", "unsupported" or "failed" after acting.
+    "swapped", "rebuilt", "unsupported" or "failed" after acting.
     """
     live = tiled_on(workspace)
     rects = as_rects(live)
@@ -738,71 +839,87 @@ def arrange_workspace(workspace: str, node: dict, area: tuple[int, int, int, int
 def reconcile_arrivals(
     profile: dict, wanted: dict[str, dict], launched: set[str], watch: float, cap: float, log, verbose: bool
 ) -> tuple[int, int]:
-    """Place profile windows that show up after the first pass and keep built-in-layout workspaces in shape.
+    """Place profile windows that show up after the first pass and bring built-in-layout workspaces in shape.
 
-    Some apps (Discord) map an updater window first and their real window much later. The window rule
-    already puts every such window on its workspace; this watch moves any that slipped through and, on a
-    workspace that runs a built-in layout, brings the tree back to the profile's (arrange_workspace) after
-    every arrival or departure, because dwindle puts a late window next to whichever window the cursor is
-    nearest. When this run launched a window of such a workspace, the watch holds for the full `cap`: the
-    real window can arrive long after a quiet updater.
+    A built-in-layout workspace that is still parked this session (see `parking`) is assembled out of
+    sight: its windows wait in the park, and once every one of its leaves has its window it is put
+    together in build order (assemble_workspace), at most `PARK_CAP` seconds after the run started, after
+    which whatever arrived is moved in. Some apps (Discord) map an updater window first and their real one
+    much later; the updater floats, so it does not count as the leaf's window.
 
-    Only workspaces this run is assembling are touched: one whose window this run launched, or one a
-    window arrived on or left during the watch. A plain `apply` on a settled desktop leaves a manually
-    resized dwindle workspace alone.
+    Any other built-in-layout workspace this run is assembling (one whose window this run launched, or one
+    a window arrived on or left during the watch) is brought back to its profile tree after every arrival
+    or departure (arrange_workspace); a plain `apply` on a settled desktop leaves manual resizing alone.
+    Windows of other workspaces that slipped past their window rule are moved to their workspace.
 
-    Returns (windows moved, workspaces arranged).
+    Returns (windows moved, workspaces put in shape).
     """
     moved = arranged = 0
     start = time.monotonic()
-    deadline = start + cap
+    active_mode = mode()
     unmanaged = unmanaged_workspaces(profile)
     area = work_area()
     workspace_of = {leaf["class"]: ws for ws, node in unmanaged.items() for leaf in leaves(node)}
-    hold_until = deadline if launched & set(workspace_of) else start
+    parked = {ws for ws, node in unmanaged.items() if parking(ws, node, active_mode)}
+    deadline = start + (max(cap, PARK_CAP) if parked else cap)
+    hold_until = start + cap if launched & set(workspace_of) else start
     known = {norm_address(str(c.get("address") or "")): c.get("class") for c in clients()}
-    assembling = {workspace_of[klass] for klass in launched if klass in workspace_of}
+    assembling = {workspace_of[klass] for klass in launched if klass in workspace_of} - parked
 
-    def settle() -> bool:
+    def settle(final: bool = False) -> bool:
         nonlocal arranged
         waiting = False
+        for workspace in sorted(parked):
+            state = assemble_workspace(workspace, unmanaged[workspace], area, verbose, final)
+            if state == "waiting":
+                waiting = True
+                continue
+            parked.discard(workspace)
+            arranged += state == "assembled"
         for workspace in sorted(assembling):
             state = arrange_workspace(workspace, unmanaged[workspace], area, verbose)
             if state in ("swapped", "rebuilt"):
                 arranged += 1
-            elif state in ("incomplete", "busy"):
+            elif state == "incomplete":
                 waiting = True
         return waiting
 
-    pending = settle()
-    keep_going = lambda: pending or time.monotonic() < hold_until  # noqa: E731
-    for kind, selector, klass in watch_events(deadline, log, idle=watch, keep_going=keep_going):
-        if kind == "idle":
-            if pending:
-                pending = settle()
-            continue
-        address = norm_address(selector)
-        if kind == "closewindow":
-            klass = known.pop(address, None)
+    try:
+        pending = settle()
+        keep_going = lambda: pending or time.monotonic() < hold_until  # noqa: E731
+        for kind, selector, klass in watch_events(deadline, log, idle=watch, keep_going=keep_going):
+            if kind == "idle":
+                if pending:
+                    pending = settle()
+                continue
+            address = norm_address(selector)
+            if kind == "closewindow":
+                klass = known.pop(address, None)
+                if klass in workspace_of:
+                    if workspace_of[klass] not in parked:
+                        assembling.add(workspace_of[klass])
+                    time.sleep(0.5)
+                    pending = settle()
+                continue
+
+            known[address] = klass
+            spec = wanted.get(klass)
+            if spec and workspace_of.get(klass) not in parked:
+                client = client_by_address(selector)
+                if not (client and on_workspace(client, spec["workspace"])):
+                    time.sleep(0.4)
+                    if move_window(selector, spec["workspace"], timeout=15):
+                        moved += 1
+                        log_line(f"late arrival placed: {klass} -> {spec['workspace']}", verbose)
             if klass in workspace_of:
-                assembling.add(workspace_of[klass])
+                if workspace_of[klass] not in parked:
+                    assembling.add(workspace_of[klass])
                 time.sleep(0.5)
                 pending = settle()
-            continue
-
-        known[address] = klass
-        spec = wanted.get(klass)
-        if spec:
-            client = client_by_address(selector)
-            if not (client and on_workspace(client, spec["workspace"])):
-                time.sleep(0.4)
-                if move_window(selector, spec["workspace"], timeout=15):
-                    moved += 1
-                    log_line(f"late arrival placed: {klass} -> {spec['workspace']}", verbose)
-        if klass in workspace_of:
-            assembling.add(workspace_of[klass])
-            time.sleep(0.5)
-            pending = settle()
+    finally:
+        # Never leave a workspace parked past the run: its windows would stay hidden.
+        if parked:
+            settle(final=True)
     return moved, arranged
 
 
@@ -847,17 +964,39 @@ def cmd_apply(args) -> int:
 
 def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) -> int:
     started = time.monotonic()
+    for stale in os.listdir(STATE_DIR) if os.path.isdir(STATE_DIR) else []:
+        if stale.startswith("assembled-") and not stale.startswith(f"assembled-{INSTANCE}-"):
+            os.unlink(os.path.join(STATE_DIR, stale))  # flags of earlier Hyprland sessions
     wanted: dict[str, dict] = {}
     for workspace, leaves_ in workspace_leaves(profile).items():
         for leaf in leaves_:
             wanted.setdefault(leaf["class"], {"leaf": leaf, "workspace": workspace})
 
-    missing = {klass: spec for klass, spec in wanted.items() if klass not in live_classes}
+    # Windows of a workspace that is still being assembled out of sight belong in the park until
+    # reconcile_arrivals puts them together; moving them to their workspace one by one is what lets
+    # dwindle build the wrong tree.
+    parked_classes = {
+        leaf["class"]
+        for workspace, node in unmanaged_workspaces(profile).items()
+        if parking(workspace, node, active_mode)
+        for leaf in leaves(node)
+    }
+
+    # Slow starters marked "launch_first" (Discord, with its updater) go first, so they are ready by the
+    # time the rest is.
+    missing = dict(
+        sorted(
+            ((klass, spec) for klass, spec in wanted.items() if klass not in live_classes),
+            key=lambda item: not item[1]["leaf"].get("launch_first", False),
+        )
+    )
 
     # Profile windows that are already running on the wrong workspace are moved as well: the point of
     # apply is that every base window ends up in the cell the profile gives it, whoever started it.
     misplaced = []
     for klass, spec in wanted.items():
+        if klass in parked_classes:
+            continue
         for client in clients():
             if (
                 client.get("class") == klass
@@ -915,6 +1054,9 @@ def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) 
         if not selector:
             absent.append((klass, "did not open in time"))
             continue
+        if klass in parked_classes:
+            placed.append((klass, PARK))
+            continue
         if move_window(selector, spec["workspace"], timeout=args.timeout):
             placed.append((klass, spec["workspace"]))
         else:
@@ -942,12 +1084,13 @@ def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) 
     time.sleep(args.settle)
     report_geometry(profile, active_mode, only_classes={klass for klass, _ in placed})
 
-    if args.watch > 0:
+    if args.watch > 0 or parked_classes:
+        # A parked workspace is assembled even with --watch 0, or its windows would stay hidden.
         late, arranged = reconcile_arrivals(
             profile,
             wanted,
             set(missing),
-            args.watch,
+            args.watch or 8,
             args.watch_cap,
             lambda message: log_line(message, args.verbose),
             args.verbose,
@@ -1197,6 +1340,8 @@ def cmd_order(args) -> int:
     for workspace, node in sorted(unmanaged.items(), key=lambda kv: float(kv[0])):
         if args.check:
             state = classify(as_rects(tiled_on(workspace)), node, area)
+        elif parking(workspace, node, mode()):
+            state = assemble_workspace(workspace, node, area, args.verbose, final=True)
         else:
             state = arrange_workspace(workspace, node, area, args.verbose)
         print(f"ws {workspace}: {state}")

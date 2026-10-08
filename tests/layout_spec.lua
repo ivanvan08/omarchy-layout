@@ -75,7 +75,14 @@ local registered, rules, window_rules = nil, {}, {}
 hl = {
   layout = { register = function(_name, provider) registered = provider end },
   workspace_rule = function(spec) rules[#rules + 1] = spec end,
-  window_rule = function(spec) window_rules[#window_rules + 1] = spec end,
+  window_rule = function(spec)
+    window_rules[#window_rules + 1] = spec
+    local rule = { spec = spec, enabled = spec.enabled ~= false }
+    function rule:set_enabled(value)
+      self.enabled = value
+    end
+    return rule
+  end,
 }
 
 local function load_module()
@@ -297,6 +304,62 @@ check("cells stay disjoint after a resize", pairwise_disjoint({
 check("cells stay inside the area after a resize",
   inside(resized_placed[classes[1]], AREA) and inside(resized_placed[classes[2]], AREA)
     and inside(resized_placed[classes[3]], AREA))
+
+--------------------------------------------------------------------------- parked assembly
+
+-- A built-in-layout workspace is assembled out of sight: until apply leaves this session's flag, its
+-- windows' rules send them to the hidden park, and the rules to the workspace itself are registered but
+-- disabled, ready for apply to switch over. With the flag, a reload registers only the normal rules.
+local parked_fixture = [[
+return {
+  ["version"] = 1,
+  ["mode"] = "external",
+  ["scratchpad"] = { { ["app"] = "scratch", ["class"] = "org.example.Scratch", ["rule"] = true } },
+  ["workspaces"] = {
+    ["3"] = { ["layout"] = "dwindle", ["split"] = "columns", ["children"] = {
+      { ["app"] = "a", ["class"] = "org.example.A" },
+      { ["app"] = "b", ["class"] = "org.example.B" },
+    } },
+  },
+}
+]]
+local session = os.getenv("HYPRLAND_INSTANCE_SIGNATURE") or "unknown"
+local flag = string.format("%s/assembled-%s-3", state_dir, session)
+os.remove(flag)
+write_profile(parked_fixture)
+load_module()
+
+local by_name = {}
+for _, spec in ipairs(window_rules) do
+  by_name[spec.name or "?"] = spec
+end
+local park_a = by_name["omarchy-layout/park/org.example.A"]
+local normal_a = by_name["omarchy-layout/org.example.A"]
+check("parked: the window goes to the hidden park", park_a ~= nil and park_a.workspace == "special:omarchy-layout-park silent",
+  park_a and park_a.workspace or "no park rule")
+check("parked: the workspace rule waits disabled", normal_a ~= nil and normal_a.enabled == false)
+check("parked: apply can reach both rule sets", #(omarchy_layout_rules.park["3"] or {}) == 2
+  and #(omarchy_layout_rules.normal["3"] or {}) == 2)
+local scratch = by_name["omarchy-layout/scratchpad/org.example.Scratch"]
+check("a scratchpad entry with its own class gets a rule", scratch ~= nil
+  and scratch.workspace == "special:scratchpad silent", scratch and scratch.workspace or "no rule")
+check("hidden windows never take focus", park_a ~= nil and park_a.no_initial_focus == true
+  and park_a.focus_on_activate == false and scratch.no_initial_focus == true
+  and scratch.focus_on_activate == false)
+
+local handle_flag = assert(io.open(flag, "w"))
+handle_flag:write("assembled\n")
+handle_flag:close()
+load_module()
+by_name = {}
+for _, spec in ipairs(window_rules) do
+  by_name[spec.name or "?"] = spec
+end
+check("assembled: a reload registers no park rule", by_name["omarchy-layout/park/org.example.A"] == nil)
+check("assembled: the workspace rule is live", by_name["omarchy-layout/org.example.A"] ~= nil
+  and by_name["omarchy-layout/org.example.A"].enabled ~= false
+  and by_name["omarchy-layout/org.example.A"].workspace == "3 silent")
+os.remove(flag)
 
 --------------------------------------------------------------------------- internal mode
 

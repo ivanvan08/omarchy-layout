@@ -104,6 +104,35 @@ class BuildPlan(unittest.TestCase):
         self.assertFalse(cli.build_feasible(node, AREA, 1.0))
 
 
+class Parking(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = (cli.STATE_DIR, cli.INSTANCE)
+        cli.STATE_DIR, cli.INSTANCE = self.tmp.name, "session-a"
+
+    def tearDown(self):
+        cli.STATE_DIR, cli.INSTANCE = self.saved
+        self.tmp.cleanup()
+
+    def test_a_dwindle_workspace_is_parked_until_this_session_assembled_it(self):
+        self.assertTrue(cli.parking("2", CHAT_WALL, "external"))
+        open(cli.assembled_flag("2"), "w").close()
+        self.assertFalse(cli.parking("2", CHAT_WALL, "external"))
+
+    def test_a_flag_from_another_session_does_not_count(self):
+        open(os.path.join(cli.STATE_DIR, "assembled-session-b-2"), "w").close()
+        self.assertTrue(cli.parking("2", CHAT_WALL, "external"))
+
+    def test_the_laptop_panel_and_managed_workspaces_never_park(self):
+        self.assertFalse(cli.parking("2", CHAT_WALL, "internal"))
+        managed = {key: value for key, value in CHAT_WALL.items() if key != "layout"}
+        self.assertFalse(cli.parking("2", managed, "external"))
+
+
+
+
 class PlanSwaps(unittest.TestCase):
     def test_every_permutation_is_sorted_in_at_most_n_minus_one_swaps(self):
         desired = ["A", "B", "C", "D"]
