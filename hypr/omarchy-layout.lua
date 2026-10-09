@@ -369,10 +369,41 @@ pcall(hl.layout.register, LAYOUT_NAME, {
 local profile = load_profile()
 for workspace, node in pairs((profile or {}).workspaces or {}) do
   local layout = (node or {}).layout
-  if not layout then
+  local opts = nil
+  if layout == "center" then
+    layout = "master"
+    opts = { orientation = "center" }
+  elseif not layout then
     layout = ((profile or {}).mode == "internal") and "scrolling" or LAYOUT_REF
   end
-  hl.workspace_rule({ workspace = tostring(workspace), layout = layout })
+  local spec = { workspace = tostring(workspace), layout = layout }
+  if opts then
+    spec.layout_opts = opts
+  end
+  hl.workspace_rule(spec)
+end
+
+-- Centre preset: master layout centres the middle window. In Hyprland 0.56.2 mfact is global
+-- (workspace rules layout_opts only parses orientation), so set master:mfact if a centre preset is present.
+local function find_center_mfact(p)
+  for _, node in pairs((p or {}).workspaces or {}) do
+    if (node or {}).layout == "center" then
+      local ratios = node.ratios
+      if ratios and type(ratios) == "table" and #ratios == 3 then
+        local total = (ratios[1] or 0) + (ratios[2] or 0) + (ratios[3] or 0)
+        if total > 0 then
+          return (ratios[2] or 0) / total
+        end
+      end
+      return 0.5
+    end
+  end
+  return nil
+end
+
+local center_mfact = find_center_mfact(profile)
+if center_mfact and hl and hl.config then
+  pcall(hl.config, { master = { mfact = center_mfact } })
 end
 
 -- Send every profile window to its workspace at map time, `silent` so focus and the visible workspace

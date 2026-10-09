@@ -70,7 +70,7 @@ local function write_profile(text)
   handle:close()
 end
 
-local registered, rules, window_rules = nil, {}, {}
+local registered, rules, window_rules, configs = nil, {}, {}, {}
 
 hl = {
   layout = { register = function(_name, provider) registered = provider end },
@@ -83,10 +83,11 @@ hl = {
     end
     return rule
   end,
+  config = function(cfg) configs[#configs + 1] = cfg end,
 }
 
 local function load_module()
-  registered, rules, window_rules = nil, {}, {}
+  registered, rules, window_rules, configs = nil, {}, {}, {}
   dofile(module_path)
   assert(registered and registered.recalculate, "layout was not registered")
 end
@@ -360,6 +361,71 @@ check("assembled: the workspace rule is live", by_name["omarchy-layout/org.examp
   and by_name["omarchy-layout/org.example.A"].enabled ~= false
   and by_name["omarchy-layout/org.example.A"].workspace == "3 silent")
 os.remove(flag)
+
+--------------------------------------------------------------------------- center preset
+
+local center_fixture = [[
+return {
+  ["version"] = 1,
+  ["mode"] = "external",
+  ["workspaces"] = {
+    ["4"] = {
+      ["layout"] = "center",
+      ["split"] = "columns",
+      ["children"] = {
+        { ["app"] = "left", ["class"] = "org.example.Left" },
+        { ["app"] = "center", ["class"] = "org.example.Center" },
+        { ["app"] = "right", ["class"] = "org.example.Right" },
+      },
+    },
+  },
+}
+]]
+local flag_4 = string.format("%s/assembled-%s-4", state_dir, session)
+os.remove(flag_4)
+write_profile(center_fixture)
+load_module()
+
+local center_rule = nil
+for _, rule in ipairs(rules) do
+  if tostring(rule.workspace) == "4" then
+    center_rule = rule
+    break
+  end
+end
+check("center: registers layout = master", center_rule ~= nil and center_rule.layout == "master",
+  center_rule and tostring(center_rule.layout) or "no rule")
+check("center: registers layout_opts.orientation = center",
+  center_rule ~= nil and center_rule.layout_opts ~= nil and center_rule.layout_opts.orientation == "center",
+  center_rule and center_rule.layout_opts and center_rule.layout_opts.orientation or "no opts")
+
+by_name = {}
+for _, spec in ipairs(window_rules) do
+  by_name[spec.name or "?"] = spec
+end
+local park_c = by_name["omarchy-layout/park/org.example.Center"]
+local normal_c = by_name["omarchy-layout/org.example.Center"]
+check("center: windows park before assembly", park_c ~= nil and park_c.workspace == "special:omarchy-layout-park silent",
+  park_c and park_c.workspace or "no park rule")
+check("center: workspace rule waits disabled", normal_c ~= nil and normal_c.enabled == false)
+check("center: apply can reach both rule sets", #(omarchy_layout_rules.park["4"] or {}) == 3
+  and #(omarchy_layout_rules.normal["4"] or {}) == 3)
+check("center: module sets master:mfact", configs[#configs] ~= nil and configs[#configs].master ~= nil
+  and configs[#configs].master.mfact == 0.5,
+  configs[#configs] and configs[#configs].master and tostring(configs[#configs].master.mfact) or "no mfact")
+
+local handle_flag_4 = assert(io.open(flag_4, "w"))
+handle_flag_4:write("assembled\n")
+handle_flag_4:close()
+load_module()
+by_name = {}
+for _, spec in ipairs(window_rules) do
+  by_name[spec.name or "?"] = spec
+end
+check("center assembled: reload registers no park rule", by_name["omarchy-layout/park/org.example.Center"] == nil)
+check("center assembled: normal rule is live", by_name["omarchy-layout/org.example.Center"] ~= nil
+  and by_name["omarchy-layout/org.example.Center"].enabled ~= false)
+os.remove(flag_4)
 
 --------------------------------------------------------------------------- internal mode
 

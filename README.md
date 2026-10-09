@@ -107,6 +107,15 @@ Schema:
         },
         { "app": "editor", "class": "org.example.Editor", "exec": "editor" }
       ]
+    },
+    "3": {
+      "layout": "center",
+      "split": "columns",
+      "children": [
+        { "app": "notes", "class": "org.example.Notes", "exec": "notes" },
+        { "app": "terminal", "class": "org.example.Terminal", "exec": "terminal" },
+        { "app": "preview", "class": "org.example.Preview", "exec": "preview" }
+      ]
     }
   }
 }
@@ -119,6 +128,9 @@ Schema:
   remaining space, equal when omitted), `children` in left-to-right / top-to-bottom order.
 - **Top level**: `version`, optional `scratchpad` (list of leaves launched into the scratchpad and
   revealed by the usual `SUPER + S`), `workspaces` (one tree per workspace number).
+- **Centre preset**: `"layout": "center"`, `"split": "columns"`, and exactly three leaves in
+  `"children"` (`[left, middle, right]`). Optional `"ratios": [s, c, s]` with equal side shares `s`;
+  the centre ratio `c` defaults to 0.5.
 
 Placement rules:
 
@@ -355,6 +367,28 @@ arrived on or left during the watch. A plain `apply` on a settled desktop does n
 When the run launched one of the workspace's windows itself, the watch holds for the whole
 `--watch-cap`, because an app with an updater window (Discord) maps its real window long after the
 updater went quiet. A workspace with a window outside the profile is left as you arranged it.
+
+### Centre preset (master layout)
+
+A workspace node with `"layout": "center"` runs Hyprland's built-in `master` layout with
+`orientation = "center"`. It places three windows:
+
+- The middle window takes the centre of the screen at full height with width governed by `mfact`
+  (default 0.5 of the work area).
+- The other two windows are equal columns flanking it on the left and right.
+- Windows remain ordinary tiled windows: dragging with `SUPER + LMB` moves and swaps windows
+  natively using master's drop logic, and border/keyboard resize (`resizeactive`) works natively.
+
+**Scope of `mfact`**: In Hyprland 0.56.2 `mfact` is global (`master:mfact`); workspace rule
+`layout_opts` only parses `orientation`, not `mfact`. Therefore, the module sets global
+`master:mfact` from the preset's centre ratio whenever the profile contains a centre preset, and
+every workspace running the master layout shares that ratio.
+
+**Assembly out of sight**: Like `dwindle`, a centre preset workspace is assembled out of sight: its
+windows wait in `special:omarchy-layout-park` at login. Once all three windows have mapped, `apply`
+moves them into the workspace in any order, then fixes window positions with swaps (`plan_swaps` and
+`hl.dsp.window.swap({ window, target })`). No cursor or focus moves are made. A settled workspace that
+`apply` is not assembling is never touched, so user resizing survives subsequent runs.
 
 ### Assembly out of sight
 

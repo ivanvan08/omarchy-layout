@@ -47,6 +47,18 @@ RIGHT_TREE = [
     ("Editor", (1607, 42, 1581, 846)),
 ]
 
+# Center preset: left, middle, right columns.
+CENTER_WALL = {
+    "layout": "center",
+    "split": "columns",
+    "children": [{"class": "Left"}, {"class": "Middle"}, {"class": "Right"}],
+}
+CENTER_RIGHT_TREE = [
+    ("Left", (12, 42, 785, 846)),
+    ("Middle", (809, 42, 1582, 846)),
+    ("Right", (2403, 42, 785, 846)),
+]
+
 
 def relabel(rects, order):
     return [(klass, rect) for klass, (_, rect) in zip(order, rects)]
@@ -71,6 +83,24 @@ class Classify(unittest.TestCase):
         extra = RIGHT_TREE + [("Other", (1607, 500, 1581, 388))]
         self.assertEqual(cli.classify(extra, CHAT_WALL, AREA), "foreign")
 
+
+    def test_center_preset_in_right_cells_is_ok(self):
+        self.assertEqual(cli.classify(CENTER_RIGHT_TREE, CENTER_WALL, AREA), "ok")
+
+    def test_center_preset_with_swapped_windows_needs_swap(self):
+        swapped = relabel(CENTER_RIGHT_TREE, ["Middle", "Left", "Right"])
+        self.assertEqual(cli.classify(swapped, CENTER_WALL, AREA), "swap")
+
+    def test_center_preset_with_wrong_cell_shapes_needs_rebuild(self):
+        wrong_shapes = relabel(WRONG_TREE, ["Left", "Middle", "Right"])
+        self.assertEqual(cli.classify(wrong_shapes, CENTER_WALL, AREA), "rebuild")
+
+    def test_center_preset_missing_window_is_incomplete(self):
+        self.assertEqual(cli.classify(CENTER_RIGHT_TREE[:2], CENTER_WALL, AREA), "incomplete")
+
+    def test_center_preset_extra_window_is_foreign(self):
+        extra = CENTER_RIGHT_TREE + [("Other", (500, 42, 200, 846))]
+        self.assertEqual(cli.classify(extra, CENTER_WALL, AREA), "foreign")
 
 class BuildPlan(unittest.TestCase):
     def test_the_second_half_is_split_off_before_the_first_half_grows(self):
@@ -103,6 +133,108 @@ class BuildPlan(unittest.TestCase):
         node = {"split": "rows", "children": [{"class": "Top"}, {"class": "Bottom"}]}
         self.assertFalse(cli.build_feasible(node, AREA, 1.0))
 
+
+
+class CenterPreset(unittest.TestCase):
+    def test_expected_cells_default_ratio(self):
+        boxes = cli.natural_boxes(CENTER_WALL, AREA)
+        self.assertEqual(
+            boxes,
+            [
+                ("Left", (12, 42, 785, 846)),
+                ("Middle", (809, 42, 1582, 846)),
+                ("Right", (2403, 42, 785, 846)),
+            ],
+        )
+
+    def test_expected_cells_non_default_ratio(self):
+        node = {
+            "layout": "center",
+            "split": "columns",
+            "ratios": [0.2, 0.6, 0.2],
+            "children": [{"class": "Left"}, {"class": "Middle"}, {"class": "Right"}],
+        }
+        boxes = cli.natural_boxes(node, AREA)
+        self.assertEqual(
+            boxes,
+            [
+                ("Left", (12, 42, 626, 846)),
+                ("Middle", (650, 42, 1900, 846)),
+                ("Right", (2562, 42, 626, 846)),
+            ],
+        )
+
+    def test_child_count_less_than_three_rejected(self):
+        node = {
+            "layout": "center",
+            "split": "columns",
+            "children": [{"class": "Left"}, {"class": "Right"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            cli.validate_workspace_node("3", node)
+        self.assertIn("exactly 3 children", str(ctx.exception))
+
+    def test_child_count_more_than_three_rejected(self):
+        node = {
+            "layout": "center",
+            "split": "columns",
+            "children": [
+                {"class": "A"},
+                {"class": "B"},
+                {"class": "C"},
+                {"class": "D"},
+            ],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            cli.validate_workspace_node("3", node)
+        self.assertIn("exactly 3 children", str(ctx.exception))
+
+    def test_non_leaf_child_rejected(self):
+        node = {
+            "layout": "center",
+            "split": "columns",
+            "children": [
+                {"class": "A"},
+                {"split": "columns", "children": [{"class": "B"}]},
+                {"class": "C"},
+            ],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            cli.validate_workspace_node("3", node)
+        self.assertIn("must be a leaf", str(ctx.exception))
+
+    def test_unequal_side_ratios_rejected(self):
+        node = {
+            "layout": "center",
+            "split": "columns",
+            "ratios": [0.2, 0.5, 0.3],
+            "children": [{"class": "A"}, {"class": "B"}, {"class": "C"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            cli.validate_workspace_node("3", node)
+        self.assertIn("equal sides", str(ctx.exception))
+
+    def test_non_columns_split_rejected(self):
+        node = {
+            "layout": "center",
+            "split": "rows",
+            "children": [{"class": "A"}, {"class": "B"}, {"class": "C"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            cli.validate_workspace_node("3", node)
+        self.assertIn("split 'columns'", str(ctx.exception))
+
+    def test_parking_behavior(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = (cli.STATE_DIR, cli.INSTANCE)
+            cli.STATE_DIR, cli.INSTANCE = tmp, "session-test"
+            try:
+                self.assertTrue(cli.parking("3", CENTER_WALL, "external"))
+                open(cli.assembled_flag("3"), "w").close()
+                self.assertFalse(cli.parking("3", CENTER_WALL, "external"))
+            finally:
+                cli.STATE_DIR, cli.INSTANCE = saved
 
 class Parking(unittest.TestCase):
     def setUp(self):
@@ -143,6 +275,16 @@ class PlanSwaps(unittest.TestCase):
                 order[i], order[j] = order[j], order[i]
             self.assertEqual(order, desired, current)
             self.assertLessEqual(len(swaps), len(desired) - 1, current)
+
+    def test_every_permutation_of_three_is_sorted_in_at_most_two_swaps(self):
+        desired = ["Left", "Middle", "Right"]
+        for current in itertools.permutations(desired):
+            order = list(current)
+            swaps = cli.plan_swaps(order, desired)
+            for i, j in swaps:
+                order[i], order[j] = order[j], order[i]
+            self.assertEqual(order, desired, current)
+            self.assertLessEqual(len(swaps), 2, current)
 
 
 if __name__ == "__main__":

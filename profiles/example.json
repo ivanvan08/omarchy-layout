@@ -17,6 +17,15 @@
         { "app": "editor", "class": "org.example.Editor", "exec": "editor" }
       ]
     },
-    "3": { "app": "files", "class": "org.example.Files", "exec": "files" }
+    "3": {
+      "layout": "center",
+      "split": "columns",
+      "children": [
+        { "app": "notes", "class": "org.example.Notes", "exec": "notes" },
+        { "app": "terminal", "class": "org.example.Terminal", "exec": "terminal" },
+        { "app": "preview", "class": "org.example.Preview", "exec": "preview" }
+      ]
+    },
+    "4": { "app": "files", "class": "org.example.Files", "exec": "files" }
   }
 }
