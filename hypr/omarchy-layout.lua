@@ -384,9 +384,15 @@ for workspace, node in pairs((profile or {}).workspaces or {}) do
 end
 
 -- Master options: in Hyprland 0.56.2 master options are global.
--- Always set slave_count_for_center_master = 0 so orientation = "center" centres the master
--- window even with 1 or 2 windows (leaving empty space on sides), and set mfact (preset ratio
--- if the profile has a center preset, else 0.5).
+-- * slave_count_for_center_master = 0 keeps orientation = "center" centred with 1 or 2 windows,
+--   leaving the sides empty (otherwise Hyprland falls back to left/right below 3 windows).
+-- * mfact is the centre column's share: the profile's centre preset ratio, else 0.5.
+-- * new_status = "slave" deviates from Omarchy's default ("master") on purpose. With "master" every
+--   dragged window becomes the master (MasterAlgorithm.cpp:68 makes BNEWISMASTER true for every drop),
+--   so dropping the centred window onto a side does nothing and dropping a side window onto the other
+--   side promotes it instead of swapping the two. With "slave" a drop lands where the cursor is: onto
+--   the master box -> becomes master; onto another window -> that slot; the master itself stays put
+--   when dropped into an empty region (master is sticky). Measured on 0.56.2, see README.
 local function find_center_mfact(p)
   for _, node in pairs((p or {}).workspaces or {}) do
     if (node or {}).layout == "center" then
@@ -408,6 +414,7 @@ if hl and hl.config then
   pcall(hl.config, {
     master = {
       slave_count_for_center_master = 0,
+      new_status = "slave",
       mfact = center_mfact,
     },
   })

@@ -417,6 +417,9 @@ check("center: module sets slave_count_for_center_master = 0",
   configs[#configs] ~= nil and configs[#configs].master ~= nil
   and configs[#configs].master.slave_count_for_center_master == 0,
   configs[#configs] and configs[#configs].master and tostring(configs[#configs].master.slave_count_for_center_master) or "no slave count")
+check("center: module sets master:new_status = slave for drop-at-cursor dragging",
+  configs[#configs] ~= nil and configs[#configs].master ~= nil and configs[#configs].master.new_status == "slave",
+  configs[#configs] and configs[#configs].master and tostring(configs[#configs].master.new_status) or "no new_status")
 
 local handle_flag_4 = assert(io.open(flag_4, "w"))
 handle_flag_4:write("assembled\n")

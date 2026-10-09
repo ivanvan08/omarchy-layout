@@ -174,7 +174,9 @@ omarchy-layout save [workspace]     # overwrite that workspace's node from the l
 omarchy-layout list                 # one line per workspace
 omarchy-layout order [workspace]    # bring built-in-layout workspaces to their profile tree
 omarchy-layout order --check        # report only, move nothing
-omarchy-layout center               # center hovered or active window in master layout
+omarchy-layout center               # toggle a centred master on the hovered or active window
+omarchy-layout center --on          # centre now (idempotent)
+omarchy-layout center --off         # restore the layout recorded by the last --on
 ```
 
 `apply` does five things, and only the first one launches anything:
@@ -323,13 +325,71 @@ child.
 
 ## Optional: keybinding
 
-To center the hovered window (or the active window) into Hyprland's `master` layout on demand, add this to `~/.config/hypr/bindings.lua`:
+To toggle a centred master on the hovered window (or the active window), add this to `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + ALT + C", "Center window", "omarchy-layout center")
 ```
 
-Hovering a tiled window and pressing the shortcut switches the workspace to `master` layout with `orientation = "center"` (persisting the rule in `~/.local/state/omarchy/workspace-layouts/<ws>.lua`), centers the hovered window at full height, and arranges the remaining windows into side columns. Pressing it again on a side window swaps that window into the centre. The target is the tiled window under the cursor on the cursor's monitor (a shown special workspace wins); hovering a floating window does nothing but notify, and hovering a gap falls back to the focused window. The cursor and the visible workspace are never moved. Workspaces with fewer than three windows keep the empty space (`master:slave_count_for_center_master` is 0), a fourth window stacks under the second and a fifth under the third. Return to `dwindle` at any time with Omarchy's standard layout toggle (`SUPER + L`). The same command works on the scratchpad: a special workspace is addressed by its **name** (`workspace = "special:scratchpad"`), never by its negative id, which Hyprland would read as the relative form and resolve to another workspace; its rule is persisted under a name-safe file (`special-scratchpad.lua`).
+Hovering a tiled window and pressing the shortcut switches the workspace to `master` layout with `orientation = "center"` (persisting the rule in `~/.local/state/omarchy/workspace-layouts/<ws>.lua`), centers the hovered window at full height, and arranges the remaining windows into side columns. Pressing it again on a side window swaps that window into the centre. The target is the tiled window under the cursor on the cursor's monitor (a shown special workspace wins); hovering a floating window does nothing but notify, and hovering a gap falls back to the focused window. The cursor and the visible workspace are never moved. Workspaces with fewer than three windows keep the empty space (`master:slave_count_for_center_master` is 0), a fourth window stacks under the second and a fifth under the third.
+
+The same command works on the scratchpad: a special workspace is addressed by its **name** (`workspace = "special:scratchpad"`), never by its negative id, which Hyprland would read as the relative form and resolve to another workspace; its rule is persisted under a name-safe file (`special-scratchpad.lua`).
+
+### It is a toggle
+
+`omarchy-layout center` toggles: the second press on the same workspace puts back what was there before
+the first one. `--on` and `--off` ask for one direction explicitly.
+
+What ON records, before it changes anything, in `~/.local/state/omarchy/layout/center-<session>-<key>.json`:
+the layout name the workspace ran, the window order, the arrangement as a tree (`node`, the shape
+`omarchy-layout save` writes, plus `dwindle_node`, the binary shape dwindle can rebuild), and the exact
+text of the workspace-layouts file. OFF re-registers the recorded layout, rebuilds the recorded
+arrangement (park + insert in order for `dwindle`; the custom provider, `scrolling` and `master` lay
+themselves out once the rule is back), restores the rule file byte for byte (or removes it when there was
+none) and deletes the snapshot.
+
+- `--on` on a workspace that is already a centred master does nothing; `--off` on a workspace with no
+  snapshot does nothing. Both exit 0.
+- A workspace that is already a centred master is never recorded, so `SUPER + L` (or `--off`) is the way
+  out for one you did not create with this command (a profile centre preset, for instance).
+- The snapshot is per Hyprland session; `apply` deletes snapshots left by earlier sessions, like the
+  `assembled-*` flags.
+- `apply` at login re-asserts the profile layout for profile workspaces, and its late-arrival watch runs
+  for up to `--watch-cap` (60 s by default), rebuilding a profile workspace's tree if it does not match
+  the profile. Pressing the toggle inside that window on a profile workspace can therefore be undone by
+  apply's own pass; after the watch has gone quiet the toggle owns the session.
+
+### Dragging in centred mode
+
+Windows are ordinary tiled windows, so Hyprland's own drag works on them - with two caveats that are
+Hyprland's, not this tool's: a centred master is **sticky** (dropping it where no window is under the
+cursor does nothing), and with exactly two windows the single side window always sits on
+`master:center_master_fallback` (left), because that is where `centerSlaveColumns` puts the first slave.
+Measured on 0.56.2, centred master with three windows (side, centre, side):
+
+| Drag | Result |
+| :--- | :--- |
+| side window onto the centre | the dragged window becomes the master, the old master takes its side |
+| side window onto the other side | the two side windows swap columns |
+| centre (master) onto a side window | the side window becomes the master and the dragged one takes that slot |
+| centre (master) into a region with no window | nothing (the master stays put) |
+| a stacked window (4+) onto the other column's window | the two swap columns |
+| a stacked window (4+) into the other column's region | it lands there |
+| a stacked window (4+) onto its own column's other window | the two swap slots |
+| either window with 2 windows, dropped into the empty side | nothing: the single slave cannot leave the fallback column |
+
+For all of this the module sets `master:new_status = "slave"`, deviating from Omarchy's default
+(`"master"`). With Omarchy's value every drop makes the dropped window the master
+(`MasterAlgorithm.cpp` sets `BNEWISMASTER` for every drop), so dropping a side window onto the other side
+promotes it instead of swapping the two, and a centred master can never be dragged out at all. Both
+values were measured on 0.56.2; `"slave"` is the one that makes a drop land where the cursor is. If you
+want Omarchy's default back, delete the `new_status` line from `hypr/omarchy-layout.lua`.
+
+Resizing is native in centred mode: `SUPER + RMB` on the centre or on a side column works, and the centre
+column keeps its middle (`mfact` changes).
+
+The escape from every caveat is the toggle itself: the second press restores the previous layout, where
+dragging is unlimited (dwindle, or whatever the workspace ran before).
 
 Unlike the persisted rule `apply` writes at login, the rule this command writes carries no `omarchy-layout` header, matching Omarchy's own layout toggle; `apply` rewrites the file (with the header) on the next login.
 

@@ -5,6 +5,7 @@ Run: python3 -m unittest tests/test_order.py
 
 import importlib.util
 import itertools
+import json
 import os
 import re
 import unittest
@@ -536,17 +537,18 @@ def scratchpad_window(address, klass, at, size):
     }
 
 
-# Dwindle-ish geometry: A | C with B sharing the middle, so the cursor can sit on C.
+# Dwindle-ish geometry on the 3200x900 work area: A and B share the left half, C is the wide right
+# column, so the tree is [[A | B] | C].
 SPECIAL_BEFORE = [
-    scratchpad_window("0xa01", "A", [12, 42], [1266, 1386]),
-    scratchpad_window("0xa02", "B", [1292, 42], [1266, 1386]),
-    scratchpad_window("0xa03", "C", [2567, 42], [2541, 1386]),
+    scratchpad_window("0xa01", "A", [12, 42], [785, 846]),
+    scratchpad_window("0xa02", "B", [809, 42], [785, 846]),
+    scratchpad_window("0xa03", "C", [1606, 42], [1582, 846]),
 ]
-# After the switch: B is the centred master, A left, C right.
+# After the switch: B is the centred master (middle 967 + 1266/2 = 1600 = the work-area middle).
 SPECIAL_AFTER = [
-    scratchpad_window("0xa01", "A", [12, 42], [900, 1386]),
-    scratchpad_window("0xa02", "B", [967, 42], [1266, 1386]),
-    scratchpad_window("0xa03", "C", [2245, 42], [943, 1386]),
+    scratchpad_window("0xa01", "A", [12, 42], [943, 846]),
+    scratchpad_window("0xa02", "B", [967, 42], [1266, 846]),
+    scratchpad_window("0xa03", "C", [2245, 42], [943, 846]),
 ]
 SPECIAL_MONITOR = {
     "id": 0,
@@ -560,45 +562,98 @@ SPECIAL_MONITOR = {
     "activeWorkspace": {"id": 1, "name": "1"},
     "specialWorkspace": {"id": -98, "name": SPECIAL},
 }
+SPECIAL_CURSOR = (2700, 400)  # inside C in both frames (BEFORE 1606..3188, AFTER 2245..3188)
 
 
-class CenterSpecialWorkspace(unittest.TestCase):
-    """The real cmd_center against a faked compositor, on a scratchpad (negative workspace id)."""
+class CenterToggle(unittest.TestCase):
+    """The real cmd_center as a toggle, against a faked compositor, on a scratchpad (negative id)."""
 
     def setUp(self):
+        import argparse
         import tempfile
 
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved_dir = cli.WORKSPACE_LAYOUTS_DIR
+        self.state_dir = os.path.join(self.tmp.name, "state")
+        self.layouts_dir = os.path.join(self.tmp.name, "workspace-layouts")
+        os.makedirs(self.state_dir)
+        os.makedirs(self.layouts_dir)
+
+        self.saved = (
+            cli.STATE_DIR,
+            cli.WORKSPACE_LAYOUTS_DIR,
+            cli.INSTANCE,
+            cli.cursor_position,
+            cli.clients,
+            cli.hyprctl_json,
+            cli.eval_lua,
+            cli.send_notification,
+            cli.rebuild_workspace,
+        )
         self.saved_env = os.environ.pop("OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR", None)
-        cli.WORKSPACE_LAYOUTS_DIR = self.tmp.name
+        cli.STATE_DIR = self.state_dir
+        cli.WORKSPACE_LAYOUTS_DIR = self.layouts_dir
+        cli.INSTANCE = "test-session"
+        self.argparse = argparse
 
         self.evals = []
-        self.pending = [SPECIAL_BEFORE, SPECIAL_AFTER]
+        self.rebuilds = []
+        self.mastered = False
         self.layouts = [{"id": -98, "name": SPECIAL, "tiledLayout": "dwindle"}]
-        self.saved = (cli.cursor_position, cli.clients, cli.hyprctl_json, cli.eval_lua, cli.send_notification)
 
         def read_clients():
-            frame = self.pending.pop(0) if len(self.pending) > 1 else self.pending[0]
+            frame = SPECIAL_AFTER if self.mastered else SPECIAL_BEFORE
             return [dict(c) for c in frame]
 
-        cli.cursor_position = lambda: (3837, 735)  # inside C of SPECIAL_BEFORE
+        cli.cursor_position = lambda: SPECIAL_CURSOR
         cli.clients = read_clients
-        cli.hyprctl_json = lambda *args: (
-            [SPECIAL_MONITOR] if args == ("monitors",) else self.layouts
-        )
-        cli.eval_lua = lambda lua: (self.evals.append(lua), True)[1]
+        cli.hyprctl_json = self.fake_query
+        cli.eval_lua = self.fake_eval
         cli.send_notification = lambda *a, **k: None
+        cli.rebuild_workspace = lambda ws, node, live, area: (self.rebuilds.append((ws, node)), "rebuilt")[1]
+
+    def fake_query(self, *args):
+        if args == ("monitors",):
+            return [SPECIAL_MONITOR]
+        if args == ("activewindow",):
+            return None
+        return self.layouts
+
+    def fake_eval(self, lua):
+        """Record the call and model the compositor: a workspace_rule eval swaps the geometry."""
+        self.evals.append(lua)
+        match = re.search(r'workspace_rule\(\{ workspace = "[^"]+", layout = "([^"]+)"', lua)
+        if match:
+            self.mastered = match.group(1) == "master"
+            self.layouts = [dict(w, tiledLayout=match.group(1)) for w in self.layouts]
+        return True
 
     def tearDown(self):
-        cli.cursor_position, cli.clients, cli.hyprctl_json, cli.eval_lua, cli.send_notification = self.saved
-        cli.WORKSPACE_LAYOUTS_DIR = self.saved_dir
+        (
+            cli.STATE_DIR,
+            cli.WORKSPACE_LAYOUTS_DIR,
+            cli.INSTANCE,
+            cli.cursor_position,
+            cli.clients,
+            cli.hyprctl_json,
+            cli.eval_lua,
+            cli.send_notification,
+            cli.rebuild_workspace,
+        ) = self.saved
         if self.saved_env is not None:
             os.environ["OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR"] = self.saved_env
         self.tmp.cleanup()
 
+    def run_center(self, mode=None):
+        return cli.cmd_center(self.argparse.Namespace(mode=mode, verbose=False))
+
+    def state_files(self):
+        return sorted(name for name in os.listdir(self.state_dir) if name.startswith("center-"))
+
+    def layout_files(self):
+        return sorted(os.listdir(self.layouts_dir))
+
     def test_a_special_workspace_is_addressed_by_name_and_never_by_its_negative_id(self):
-        cli.cmd_center(None)
+        self.run_center()
         rules = [lua for lua in self.evals if "workspace_rule" in lua]
         self.assertEqual(len(rules), 1, self.evals)
         self.assertIn(f'workspace = "{SPECIAL}"', rules[0])
@@ -610,26 +665,99 @@ class CenterSpecialWorkspace(unittest.TestCase):
             self.assertIsNone(re.search(r"-\d", lua), lua)
 
     def test_the_written_rule_has_no_negative_number_anywhere(self):
-        cli.cmd_center(None)
-        files = os.listdir(self.tmp.name)
-        self.assertEqual(files, [f"{SPECIAL.replace(':', '-')}.lua"], files)
-        for name in files:
+        self.run_center()
+        self.assertEqual(self.layout_files(), [f"{SPECIAL.replace(':', '-')}.lua"], self.layout_files())
+        for name in self.layout_files():
             self.assertFalse(name.startswith("-"), name)
-        with open(os.path.join(self.tmp.name, files[0])) as handle:
+        with open(os.path.join(self.layouts_dir, self.layout_files()[0])) as handle:
             text = handle.read()
-        self.assertEqual(text.count("workspace_rule"), 1, text)
         self.assertIn(f'workspace = "{SPECIAL}"', text)
         self.assertIn('layout = "master"', text)
         self.assertIn('orientation = "center"', text)
         self.assertIsNone(re.search(r"-\d", text), text)
 
-    def test_an_already_centred_special_workspace_writes_nothing(self):
-        self.pending = [SPECIAL_AFTER]
-        self.layouts = [{"id": -98, "name": SPECIAL, "tiledLayout": "master"}]
-        cli.cursor_position = lambda: (1600, 735)  # inside the centred master B
-        cli.cmd_center(None)
+    def test_on_records_the_previous_state_and_off_puts_it_back(self):
+        self.run_center()
+        state_files = self.state_files()
+        self.assertEqual(len(state_files), 1, state_files)
+        self.assertTrue(state_files[0].startswith("center-test-session-"), state_files[0])
+        with open(os.path.join(self.state_dir, state_files[0])) as handle:
+            state = json.load(handle)
+        self.assertEqual(state["layout"], "dwindle")
+        self.assertEqual(state["selector"], SPECIAL)
+        self.assertEqual(state["layout_opts"], None)
+        self.assertEqual(state["order"], ["A", "B", "C"])
+        self.assertEqual(state["persisted_text"], None)
+        self.assertEqual(state["node"]["children"][0]["class"], "A")
+
+        before = len(self.evals)
+        self.run_center()
+        rules = [lua for lua in self.evals[before:] if "workspace_rule" in lua]
+        self.assertEqual(len(rules), 1, self.evals[before:])
+        self.assertIn('layout = "dwindle"', rules[0])
+        self.assertEqual(self.rebuilds, [(SPECIAL, state["dwindle_node"])])
+        self.assertEqual(self.state_files(), [])
+        self.assertEqual(self.layout_files(), [])
+
+    def test_the_recorded_dwindle_tree_nests_the_way_dwindle_built_it(self):
+        # A and B share the left half, C is the wide right column: [[A | B] | C]. The flat `save`
+        # shape cannot express that (it simulates to the wide column first), so the dwindle tree is
+        # recorded separately and is what OFF rebuilds from.
+        self.run_center()
+        with open(os.path.join(self.state_dir, self.state_files()[0])) as handle:
+            state = json.load(handle)
+        self.assertEqual(
+            state["dwindle_node"],
+            {
+                "split": "columns",
+                "children": [
+                    {"split": "columns", "children": [{"class": "A"}, {"class": "B"}]},
+                    {"class": "C"},
+                ],
+            },
+        )
+        start, steps = cli.build_steps(state["dwindle_node"])
+        boxes = {start: (12, 42, 5096, 1386)}
+        for new, target, split in steps:
+            x, y, w, h = boxes[target]
+            boxes[target], boxes[new] = (x, y, w / 2, h), (x + w / 2, y, w / 2, h)
+        self.assertGreater(boxes["C"][2], boxes["A"][2], boxes)  # the wide column is C
+        self.assertEqual(boxes["A"][2], boxes["B"][2], boxes)
+
+    def test_on_is_idempotent(self):
+        self.run_center("on")
+        first = len(self.evals)
+        self.run_center("on")
+        self.assertEqual(self.evals[first:], [])
+        self.assertEqual(len(self.state_files()), 1)
+
+    def test_off_without_a_recorded_state_does_nothing(self):
+        self.assertEqual(self.run_center("off"), 0)
         self.assertEqual(self.evals, [])
-        self.assertEqual(os.listdir(self.tmp.name), [])
+        self.assertEqual(self.state_files(), [])
+
+    def test_off_restores_the_rule_file_a_profile_workspace_had(self):
+        original = '-- written by omarchy-layout\nhl.workspace_rule({ workspace = "special:scratchpad", layout = "dwindle" })\n'
+        path = os.path.join(self.layouts_dir, "special-scratchpad.lua")
+        with open(path, "w") as handle:
+            handle.write(original)
+        self.run_center("on")
+        with open(path) as handle:
+            self.assertIn('layout = "master"', handle.read())
+        self.run_center("off")
+        with open(path) as handle:
+            self.assertEqual(handle.read(), original)
+        self.assertEqual(self.state_files(), [])
+
+    def test_stale_state_of_other_sessions_is_pruned(self):
+        other = os.path.join(self.state_dir, "center-other-session-special-scratchpad.json")
+        mine = os.path.join(self.state_dir, "center-test-session-3.json")
+        flag = os.path.join(self.state_dir, "assembled-other-session-2")
+        for path in (other, mine, flag):
+            with open(path, "w") as handle:
+                handle.write("{}\n")
+        cli.prune_other_session_state()
+        self.assertEqual(self.state_files(), ["center-test-session-3.json"])
 
     def test_rule_target_derivation(self):
         self.assertEqual(cli.workspace_rule_target({"id": 3, "name": "3"}), ("3", "3"))
@@ -638,6 +766,87 @@ class CenterSpecialWorkspace(unittest.TestCase):
         )
         self.assertEqual(cli.workspace_rule_target({"id": 7, "name": "web"}), ("7", "7"))
         self.assertIsNone(cli.workspace_rule_target({"id": -98, "name": ""}))
+
+
+class CenterOnNormalWorkspace(unittest.TestCase):
+    """The toggle on a numbered workspace whose rule file already exists (a profile workspace)."""
+
+    def setUp(self):
+        import argparse
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_dir = os.path.join(self.tmp.name, "state")
+        self.layouts_dir = os.path.join(self.tmp.name, "workspace-layouts")
+        os.makedirs(self.state_dir)
+        os.makedirs(self.layouts_dir)
+        self.original = '-- written by omarchy-layout - https://github.com/ivanvan08/omarchy-layout\nhl.workspace_rule({ workspace = "2", layout = "dwindle" })\n'
+        self.rule_path = os.path.join(self.layouts_dir, "2.lua")
+        with open(self.rule_path, "w") as handle:
+            handle.write(self.original)
+
+        self.saved = (
+            cli.STATE_DIR, cli.WORKSPACE_LAYOUTS_DIR, cli.INSTANCE,
+            cli.cursor_position, cli.clients, cli.hyprctl_json, cli.eval_lua, cli.rebuild_workspace,
+        )
+        cli.STATE_DIR, cli.WORKSPACE_LAYOUTS_DIR, cli.INSTANCE = self.state_dir, self.layouts_dir, "test-session"
+        self.argparse = argparse
+        self.evals = []
+
+        windows = [
+            {"address": "0xb01", "class": "A", "at": [12, 42], "size": [785, 846],
+             "workspace": {"id": 2, "name": "2"}, "floating": False, "mapped": True, "monitor": 0},
+            {"address": "0xb02", "class": "B", "at": [809, 42], "size": [785, 846],
+             "workspace": {"id": 2, "name": "2"}, "floating": False, "mapped": True, "monitor": 0},
+            {"address": "0xb03", "class": "C", "at": [1606, 42], "size": [1582, 846],
+             "workspace": {"id": 2, "name": "2"}, "floating": False, "mapped": True, "monitor": 0},
+        ]
+        after = [dict(w, at=[12, 42], size=[943, 846]) for w in windows[:1]]
+        after.append(dict(windows[1], at=[967, 42], size=[1266, 846]))
+        after.append(dict(windows[2], at=[2245, 42], size=[943, 846]))
+        self.mastered = False
+
+        def read_clients():
+            return [dict(c) for c in (after if self.mastered else windows)]
+
+        monitor = dict(SPECIAL_MONITOR, activeWorkspace={"id": 2, "name": "2"}, specialWorkspace={"id": 0, "name": ""})
+        self.layouts = [{"id": 2, "name": "2", "tiledLayout": "dwindle"}]
+        cli.cursor_position = lambda: SPECIAL_CURSOR
+        cli.clients = read_clients
+        cli.hyprctl_json = lambda *args: [monitor] if args == ("monitors",) else (None if args == ("activewindow",) else self.layouts)
+        cli.eval_lua = self.fake_eval
+        cli.rebuild_workspace = lambda ws, node, live, area: "rebuilt"
+
+    def fake_eval(self, lua):
+        """Record the call and model the compositor: a workspace_rule eval swaps the geometry."""
+        self.evals.append(lua)
+        match = re.search(r'workspace_rule\(\{ workspace = "[^"]+", layout = "([^"]+)"', lua)
+        if match:
+            self.mastered = match.group(1) == "master"
+            self.layouts = [dict(w, tiledLayout=match.group(1)) for w in self.layouts]
+        return True
+
+    def tearDown(self):
+        (
+            cli.STATE_DIR, cli.WORKSPACE_LAYOUTS_DIR, cli.INSTANCE,
+            cli.cursor_position, cli.clients, cli.hyprctl_json, cli.eval_lua, cli.rebuild_workspace,
+        ) = self.saved
+        self.tmp.cleanup()
+
+    def test_a_numbered_workspace_keeps_its_numeric_key_and_restores_its_rule_file(self):
+        cli.cmd_center(self.argparse.Namespace(mode=None, verbose=False))
+        self.assertEqual(sorted(os.listdir(self.layouts_dir)), ["2.lua"])
+        with open(self.rule_path) as handle:
+            self.assertIn('layout = "master"', handle.read())
+        self.assertEqual(sorted(n for n in os.listdir(self.state_dir) if n.startswith("center-")),
+                         ["center-test-session-2.json"])
+
+        cli.cmd_center(self.argparse.Namespace(mode="off", verbose=False))
+        with open(self.rule_path) as handle:
+            self.assertEqual(handle.read(), self.original)
+        self.assertEqual([n for n in os.listdir(self.state_dir) if n.startswith("center-")], [])
+        rules = [lua for lua in self.evals if "workspace_rule" in lua]
+        self.assertEqual(rules[-1], 'hl.workspace_rule({ workspace = "2", layout = "dwindle" })')
 
 
 if __name__ == "__main__":

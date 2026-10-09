@@ -1083,11 +1083,26 @@ def cmd_apply(args) -> int:
         release_lock()
 
 
+def prune_other_session_state() -> None:
+    """Drop this tool's per-session state left by earlier Hyprland sessions.
+
+    `assembled-<session>-<workspace>` flags and `center-<session>-<file_key>.json` toggle snapshots
+    describe a compositor that is gone: the windows they refer to no longer exist, so keeping them
+    would make the next press of the toggle believe the workspace is still centred.
+    """
+    for stale in os.listdir(STATE_DIR) if os.path.isdir(STATE_DIR) else []:
+        for prefix in ("assembled-", "center-"):
+            if stale.startswith(prefix) and not stale.startswith(f"{prefix}{INSTANCE}-"):
+                try:
+                    os.unlink(os.path.join(STATE_DIR, stale))
+                except OSError:
+                    pass
+                break
+
+
 def apply_locked(args, profile: dict, active_mode: str, live_classes: set[str]) -> int:
     started = time.monotonic()
-    for stale in os.listdir(STATE_DIR) if os.path.isdir(STATE_DIR) else []:
-        if stale.startswith("assembled-") and not stale.startswith(f"assembled-{INSTANCE}-"):
-            os.unlink(os.path.join(STATE_DIR, stale))  # flags of earlier Hyprland sessions
+    prune_other_session_state()
     wanted: dict[str, dict] = {}
     for workspace, leaves_ in workspace_leaves(profile).items():
         for leaf in leaves_:
@@ -1433,6 +1448,114 @@ def guess_exec(klass: str) -> str:
     return klass.lower()
 
 
+def tiled_rects_on(workspace: str) -> list[tuple[dict, tuple[int, int, int, int]]]:
+    """Tiled, mapped windows of a workspace with their rects, in reading order (top to bottom, then left
+    to right). `workspace` is a rule selector, so a special workspace can be named by `special:<name>`."""
+    rects = []
+    for client in clients():
+        if not on_workspace(client, workspace):
+            continue
+        if not (client.get("mapped") or 0) or client.get("floating"):
+            continue
+        x, y = client["at"]
+        w, h = client["size"]
+        rects.append((client, (x, y, w, h)))
+    rects.sort(key=lambda item: (item[1][1], item[1][0]))
+    return rects
+
+
+def dwindle_tree_from_rects(
+    rects: list[tuple[dict, tuple[int, int, int, int]]],
+    cell: tuple[int, int, int, int],
+    tolerance: int = SHAPE_TOLERANCE,
+) -> dict | None:
+    """The binary tree dwindle would have for a live arrangement of `cell`, or None if it does not fit.
+
+    `save_node_from_rects` writes a flat row-of-columns tree, which is what the custom provider reads
+    and what `save` writes, but dwindle cannot build it: dwindle splits one window at a time and always
+    halves the cell (default_split_ratio), so its tree from insertion is binary and nesting matters
+    (`[[a | b] | c]` puts the wide column last, `[a | [b | c]]` puts it first, and the flat tree
+    simulates to the second shape whatever the ratios say). This rebuilds the nesting from the cells:
+    halve the cell, recurse into whichever half holds more than one window. A cell that is not a plain
+    halving arrangement (a manually resized workspace) returns None and the caller falls back.
+    """
+    if not rects:
+        return None
+    if len(rects) == 1:
+        return {"class": rects[0][0].get("class")}
+
+    x, y, w, h = cell
+    side_by_side = w >= h
+    if side_by_side:
+        part = int(round(0.5 * (w + GAP))) - GAP
+        halves = ((x, y, part, h), (x + part + GAP, y, w - part - GAP, h))
+    else:
+        part = int(round(0.5 * (h + GAP))) - GAP
+        halves = ((x, y, w, part), (x, y + part + GAP, w, h - part - GAP))
+
+    children: list[dict] = []
+    remaining = list(rects)
+    for hx, hy, hw, hh in halves:
+        inside = []
+        outside = []
+        for item in remaining:
+            rx, ry, rw, rh = item[1]
+            cx, cy = rx + rw / 2.0, ry + rh / 2.0
+            # Containment alone would let the tolerance pull a neighbour into the wrong half when a
+            # window border sits on the boundary; the centre has to be inside as well.
+            contained = (
+                hx <= cx <= hx + hw
+                and hy <= cy <= hy + hh
+                and hx - tolerance <= rx
+                and rx + rw <= hx + hw + tolerance
+                and hy - tolerance <= ry
+                and ry + rh <= hy + hh + tolerance
+            )
+            (inside if contained else outside).append(item)
+        if not inside:
+            return None
+        children.append(inside)
+        remaining = outside
+    if remaining:
+        return None
+
+    built = []
+    for group, half in zip(children, halves):
+        node = dwindle_tree_from_rects(group, half, tolerance)
+        if node is None:
+            return None
+        built.append(node)
+    return {"split": "columns" if side_by_side else "rows", "children": built}
+
+
+def save_node_from_rects(rects: list[tuple[dict, tuple[int, int, int, int]]]) -> dict:
+    """Profile-shaped tree for a live arrangement: rows of columns, ratios read off the rectangles.
+
+    Shared by `cmd_save` and the centre toggle, so the arrangement a toggle records is the same shape
+    `save` would write for the same screen. Bands are the horizontal rows of the arrangement, keyed by
+    their top edge and height; each band becomes a `columns` node of its windows in left-to-right order.
+    """
+    if not rects:
+        raise ValueError("no windows to describe")
+    bands: dict[tuple[int, int], list] = {}
+    for item in rects:
+        bands.setdefault((item[1][1], item[1][3]), []).append(item)
+    band_keys = sorted(bands)
+    if len(band_keys) == 1:
+        return build_saved_node(list(rects))
+
+    top = min(rect[1][1] for _client, rect in rects)
+    bottom = max(rect[1][1] + rect[1][3] for _client, rect in rects)
+    total = bottom - top
+    children = []
+    ratios = []
+    for key in band_keys:
+        band = sorted(bands[key], key=lambda item: item[1][0])
+        children.append(build_saved_node(band))
+        ratios.append(round(band[0][1][3] / total, 4))
+    return {"split": "rows", "ratios": ratios, "children": children}
+
+
 def build_saved_node(rects: list[tuple[dict, tuple[int, int, int, int]]], horizontal: bool = True) -> dict:
     if len(rects) == 1:
         client = rects[0][0]
@@ -1457,36 +1580,11 @@ def cmd_save(args) -> int:
     else:
         active = hyprctl_json("activeworkspace") or {}
         workspace = str(active.get("id", "1"))
-    rects = []
-    for client in clients():
-        if str(client["workspace"]["id"]) != workspace:
-            continue
-        if not (client.get("mapped") or 0) or client.get("floating"):
-            continue
-        x, y = client["at"]
-        w, h = client["size"]
-        rects.append((client, (x, y, w, h)))
+    rects = tiled_rects_on(workspace)
     if not rects:
         print(f"no tiled windows on workspace {workspace}")
         return 1
-    rects.sort(key=lambda item: (item[1][1], item[1][0]))
-
-    bands: dict[tuple[int, int], list] = {}
-    for item in rects:
-        bands.setdefault((item[1][1], item[1][3]), []).append(item)
-    band_keys = sorted(bands)
-    if len(band_keys) == 1:
-        node = build_saved_node(list(rects))
-    else:
-        heights = [band[1] for band in bands.values()]
-        total = max(b[1][1] + b[1][3] for b in bands.values()) - min(b[1][1] for b in bands.values())
-        children = []
-        ratios = []
-        for key in band_keys:
-            band = sorted(bands[key], key=lambda item: item[1][0])
-            children.append(build_saved_node(band) if len(band) > 1 else build_saved_node([band[0]]))
-            ratios.append(round(heights[band_keys.index(key)] / total, 4))
-        node = {"split": "rows", "ratios": ratios, "children": children}
+    node = save_node_from_rects(rects)
 
     profile.setdefault("workspaces", {})[workspace] = node
     with open(personal_profile_file(), "w") as handle:
@@ -1728,57 +1826,137 @@ def is_centered(window: dict, mid_x: float, tolerance: float = SHAPE_TOLERANCE) 
     return abs(x + w / 2.0 - mid_x) <= tolerance
 
 
-def cmd_center(args) -> int:
-    """Put the hovered tiled window (or the focused one) in the middle of its workspace.
+CENTER_STATE_VERSION = 1
 
-    The workspace runs Hyprland's master layout with orientation center: the master is the middle
-    column and the other windows alternate left/right, stacking per side. A workspace that does not
-    show a centred master yet gets the rule at runtime (the rule takes effect within the same
-    `hyprctl eval`, so the geometry read next is already the master one) and is persisted
-    Omarchy-style. The target then swaps with the current master. `hl.dsp.window.swap` warps the
-    cursor to the swapped window, so the same eval puts the cursor back where it was.
 
-    A special workspace (negative id) is addressed by name, never by id: `workspace = "-98"` is the
-    RELATIVE form and resolves to `max(active - 98, 1)` (see workspace_rule_target), which is how an
-    earlier version switched the user's workspace 1 instead of the scratchpad.
+def center_state_file(file_key: str) -> str:
+    return os.path.join(STATE_DIR, f"center-{INSTANCE}-{file_key}.json")
+
+
+def load_center_state(file_key: str) -> dict | None:
+    try:
+        with open(center_state_file(file_key)) as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) and data.get("version") == CENTER_STATE_VERSION else None
+
+
+def write_center_state(file_key: str, state: dict) -> str:
+    path = center_state_file(file_key)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(state, handle, indent=2)
+        handle.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def drop_center_state(file_key: str) -> None:
+    try:
+        os.unlink(center_state_file(file_key))
+    except OSError:
+        pass
+
+
+def persisted_rule_text(file_key: str) -> str | None:
+    path = os.path.join(workspace_layouts_dir(), f"{file_key}.lua")
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def center_snapshot(selector: str, file_key: str, area: tuple[int, int, int, int]) -> dict:
+    """What the workspace looked like before the toggle turned it into a centred master.
+
+    `layout_opts` is always null: a snapshot is only taken when the workspace is NOT a centred master
+    (that state is what the toggle turns ON, and ON is idempotent there), so restoring the recorded
+    layout name alone reproduces the rule the workspace ran before. `node` is the tree `save` would
+    write; `dwindle_node` is the same arrangement in the binary shape dwindle can rebuild (null when
+    the arrangement is not a plain halving, e.g. after a manual resize).
     """
-    cursor = cursor_position()
-    monitors_list = hyprctl_json("monitors") or []
-    active_win = hyprctl_json("activewindow") or None
-    clients_list = clients()
+    rects = tiled_rects_on(selector)
+    info = next(
+        (
+            w
+            for w in (hyprctl_json("workspaces") or [])
+            if str(w.get("id")) == selector or w.get("name") == selector
+        ),
+        {},
+    )
+    return {
+        "version": CENTER_STATE_VERSION,
+        "selector": selector,
+        "file_key": file_key,
+        "layout": info.get("tiledLayout") or "",
+        "layout_opts": None,
+        "order": [client.get("class") for client, _ in rects],
+        "node": save_node_from_rects(rects) if rects else None,
+        "dwindle_node": dwindle_tree_from_rects(rects, area) if rects else None,
+        "persisted_text": persisted_rule_text(file_key),
+    }
 
-    target, err = find_target_window(cursor, clients_list, monitors_list, active_win)
-    if err == "floating":
-        send_notification("Centre window: floating windows are not tiled")
-        return 0
-    if not target:
-        return 0
 
-    ws_info = target.get("workspace") or {}
-    target_ws = workspace_rule_target(ws_info)
-    if not target_ws:
-        send_notification("Centre window: this workspace has no addressable rule target")
-        return 0
-    ws_selector, ws_file_key = target_ws
-    monitor = next((m for m in monitors_list if m.get("id") == target.get("monitor")), None)
-    mid = workarea_mid_x(monitor)
+def restore_persisted_rule(file_key: str, text: str | None) -> None:
+    """Put the workspace-layouts file back the way it was: the recorded text, or no file at all."""
+    path = os.path.join(workspace_layouts_dir(), f"{file_key}.lua")
+    if text is None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return
+    os.makedirs(workspace_layouts_dir(), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
 
-    def tiled_here(items: list[dict]) -> list[dict]:
-        return [c for c in items if c.get("mapped") and not c.get("floating") and on_workspace(c, ws_selector)]
 
-    tiled = tiled_here(clients_list)
-    workspaces = hyprctl_json("workspaces") or []
-    info = next((w for w in workspaces if str(w.get("id")) == ws_selector or w.get("name") == ws_selector), {})
+def center_off(state: dict, selector: str, file_key: str, area: tuple[int, int, int, int], verbose: bool) -> int:
+    """Put a workspace back the way the toggle found it: recorded layout, arrangement and rule file."""
+    layout = state.get("layout") or "dwindle"
+    if not eval_lua(f'hl.workspace_rule({{ workspace = "{selector}", layout = "{layout}" }})'):
+        return 1
+    state_name = "restored"
+    if layout == "dwindle":
+        # dwindle rebuilds its tree from insertion order, so park the windows and put them back in the
+        # shape the snapshot recorded (the binary tree; the `save`-shaped one is the fallback). Other
+        # layouts lay themselves out once the rule is back: the custom provider places by class, and
+        # scrolling and master recalculate on their own.
+        node = state.get("dwindle_node") or state.get("node")
+        if node:
+            state_name = rebuild_workspace(selector, node, tiled_on(selector), area)
+    restore_persisted_rule(file_key, state.get("persisted_text"))
+    drop_center_state(file_key)
+    log_line(f"center off ws {selector}: {state_name}", verbose)
+    return 0
+
+
+def center_on(
+    selector: str,
+    file_key: str,
+    target: dict,
+    monitor: dict | None,
+    mid: float,
+    area: tuple[int, int, int, int],
+    cursor: tuple[int, int] | None,
+    verbose: bool,
+) -> int:
+    """Switch a workspace to a centred master, make `target` the master, and record how to undo it."""
+    snapshot = center_snapshot(selector, file_key, area)
+    eval_lua(
+        f'hl.workspace_rule({{ workspace = "{selector}", layout = "master", '
+        f'layout_opts = {{ orientation = "center" }} }}); '
+    )
+    persist_workspace_layout_omarchy_style(selector, file_key, "master", {"orientation": "center"})
+    write_center_state(file_key, snapshot)
+
+    tiled = [c for c in clients() if c.get("mapped") and not c.get("floating") and on_workspace(c, selector)]
     master = identify_master_window(tiled, mid)
-    if info.get("tiledLayout") != "master" or not (master and is_centered(master, mid)):
-        eval_lua(
-            f'hl.workspace_rule({{ workspace = "{ws_selector}", layout = "master", '
-            f'layout_opts = {{ orientation = "center" }} }}); '
-        )
-        persist_workspace_layout_omarchy_style(ws_selector, ws_file_key, "master", {"orientation": "center"})
-        tiled = tiled_here(clients())
-        master = identify_master_window(tiled, mid)
-
     if not master:
         return 0
     swaps = plan_center_swap(target, master)
@@ -1791,7 +1969,81 @@ def cmd_center(args) -> int:
     if cursor:
         lua += f"hl.dispatch(hl.dsp.cursor.move({{ x = {cursor[0]}, y = {cursor[1]} }}))"
     eval_lua(lua)
+    log_line(f"center on ws {selector}: was {snapshot['layout']}", verbose)
     return 0
+
+
+def is_centred_master(
+    selector: str, tiled: list[dict], workspaces: list[dict], mid: float
+) -> bool:
+    """Whether a workspace already runs a master layout whose master sits in the work-area middle."""
+    info = next(
+        (w for w in workspaces if str(w.get("id")) == selector or w.get("name") == selector), {}
+    )
+    if info.get("tiledLayout") != "master":
+        return False
+    master = identify_master_window(tiled, mid)
+    return bool(master and is_centered(master, mid))
+
+
+def cmd_center(args) -> int:
+    """Toggle a workspace between its own layout and a centred master, centred on the hovered window.
+
+    Target selection is unchanged: the tiled window under the cursor on the cursor's monitor (a shown
+    special workspace wins), a floating window under the cursor is a no-op with a notification, and a
+    cursor over a gap falls back to the focused tiled window. No keypress moves the cursor or switches
+    the visible workspace.
+
+    ON (no flag with no recorded state, or `--on`): the workspace runs Hyprland's master layout with
+    orientation center, `target` swaps into the master slot, and the pre-toggle layout name, window
+    order, tree and rule file are recorded under `center-<INSTANCE>-<file_key>.json`, so the next press
+    puts everything back. Idempotent: `--on` on an already centred workspace does nothing.
+
+    OFF (no flag with a recorded state, or `--off`): the recorded layout rule is registered again and,
+    for dwindle, the recorded arrangement is rebuilt (park + insert in order); the rule file is restored
+    to its recorded text (or removed when there was none) and the state file is deleted. `--off` on a
+    workspace with no recorded state does nothing.
+
+    A workspace whose layout is already a centred master is never recorded: that is the state ON
+    produces, so ON is idempotent there and OFF has nothing to do.
+    """
+    verbose = bool(getattr(args, "verbose", False))
+    cursor = cursor_position()
+    monitors_list = hyprctl_json("monitors") or []
+    active_win = hyprctl_json("activewindow") or None
+    clients_list = clients()
+
+    target, err = find_target_window(cursor, clients_list, monitors_list, active_win)
+    if err == "floating":
+        send_notification("Centre window: floating windows are not tiled")
+        return 0
+    if not target:
+        return 0
+
+    target_ws = workspace_rule_target(target.get("workspace") or {})
+    if not target_ws:
+        send_notification("Centre window: this workspace has no addressable rule target")
+        return 0
+    ws_selector, ws_file_key = target_ws
+    state = load_center_state(ws_file_key)
+
+    mode = getattr(args, "mode", None)
+    if mode == "off" or (mode is None and state):
+        if not state:
+            log_line(f"center off ws {ws_selector}: not centred", verbose)
+            return 0
+        return center_off(state, ws_selector, ws_file_key, work_area(), verbose)
+    if state:
+        log_line(f"center on ws {ws_selector}: already centred", verbose)
+        return 0
+
+    monitor = next((m for m in monitors_list if m.get("id") == target.get("monitor")), None)
+    mid = workarea_mid_x(monitor)
+    tiled = [c for c in clients_list if c.get("mapped") and not c.get("floating") and on_workspace(c, ws_selector)]
+    if is_centred_master(ws_selector, tiled, hyprctl_json("workspaces") or [], mid):
+        log_line(f"center on ws {ws_selector}: already centred", verbose)
+        return 0
+    return center_on(ws_selector, ws_file_key, target, monitor, mid, work_area(), cursor, verbose)
 
 
 def cmd_list(args) -> int:
@@ -1837,7 +2089,10 @@ def main(argv=None) -> int:
     order_parser.add_argument("--check", action="store_true", help="report only, move nothing")
     order_parser.add_argument("--verbose", action="store_true")
 
-    sub.add_parser("center", help="center the hovered or active window using master layout")
+    center_parser = sub.add_parser("center", help="toggle a centred master on the hovered or active window")
+    center_parser.add_argument("--on", dest="mode", action="store_const", const="on", help="centre now (idempotent)")
+    center_parser.add_argument("--off", dest="mode", action="store_const", const="off", help="restore the recorded layout")
+    center_parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     handler = {
         "apply": cmd_apply,
