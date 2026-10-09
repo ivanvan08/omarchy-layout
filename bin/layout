@@ -1310,6 +1310,12 @@ def write_workspace_layouts(
     those files survive a reload, and the files left behind by the retired omarchy-session tool
     otherwise win the race and hand the workspace dwindle or scrolling instead of our layout.
 
+    Two kinds of leftover are deleted: our own files for workspaces the profile no longer names, and a
+    file holding exactly the centred-mode rule with no header - that is what the version that persisted
+    the mode wrote, and it made a config load (a theme switch, `omarchy refresh`, `hyprctl reload`) put
+    the workspace back into the mode with no keypress. Anything else, including our own centre preset
+    (the same rule plus the header), is left alone.
+
     Layout files are only persisted when running the default profile; with an override
     (OMARCHY_LAYOUT_PROFILE set), rules apply at runtime only.
     """
@@ -1324,18 +1330,24 @@ def write_workspace_layouts(
             if not fname.endswith(".lua"):
                 continue
             ws = fname[:-4]
-            if ws in profile_workspaces:
-                continue
             path = os.path.join(directory, fname)
-            if not is_our_layout_file(path):
+            ours = ws not in profile_workspaces and is_our_layout_file(path)
+            leftover_mode = False
+            if not ours:
+                try:
+                    with open(path) as handle:
+                        leftover_mode = mode_file_selector(handle.read()) is not None
+                except OSError:
+                    leftover_mode = False
+            if not (ours or leftover_mode):
                 continue
             if dry_run:
                 print(f"[dry-run] would delete stale layout rule {path}")
-            else:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     written = []
     for workspace, node in (profile.get("workspaces") or {}).items():
@@ -1777,40 +1789,6 @@ def workspace_rule_target(ws_info: dict) -> tuple[str, str] | None:
     return name, re.sub(r"[^A-Za-z0-9._-]", "-", name)
 
 
-def persist_workspace_layout_omarchy_style(
-    selector: str, file_key: str, layout: str, layout_opts: dict | None = None
-) -> str | None:
-    """Persist a workspace rule Omarchy-style: `<file_key>.lua`, no omarchy-layout header.
-
-    Omarchy's layout toggle writes `~/.local/state/omarchy/workspace-layouts/<ws>.lua` directly,
-    without a header. Writing the same shape keeps the rule across config reloads and out of
-    omarchy-layout's stale-rule pruning (which only deletes files carrying its header). The
-    selector in the rule text and the file key are separate: a special workspace is addressed by
-    name but cannot be named with a colon on disk.
-    """
-    if not file_key or not re.fullmatch(r"[A-Za-z0-9._-]+", file_key):
-        return None
-    directory = workspace_layouts_dir()
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, f"{file_key}.lua")
-
-    if layout_opts:
-        opts_lua = ", ".join(
-            f'{k} = "{v}"' if isinstance(v, str) else f"{k} = {v}"
-            for k, v in layout_opts.items()
-        )
-        rule_lua = f'hl.workspace_rule({{ workspace = "{selector}", layout = "{layout}", layout_opts = {{ {opts_lua} }} }})'
-    else:
-        rule_lua = f'hl.workspace_rule({{ workspace = "{selector}", layout = "{layout}" }})'
-
-    text = f"{rule_lua}\n"
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(tmp, path)
-    return path
-
-
 def workarea_mid_x(monitor: dict | None) -> float:
     """Horizontal middle of a monitor's work area in layout coordinates (reserved edges excluded)."""
     if not monitor:
@@ -1824,6 +1802,57 @@ def workarea_mid_x(monitor: dict | None) -> float:
 def is_centered(window: dict, mid_x: float, tolerance: float = SHAPE_TOLERANCE) -> bool:
     x, w = window.get("at", [0, 0])[0], window.get("size", [0, 0])[0]
     return abs(x + w / 2.0 - mid_x) <= tolerance
+
+
+CENTER_MODE_RULE = 'hl.workspace_rule({{ workspace = "{selector}", layout = "master", layout_opts = {{ orientation = "center" }} }})'
+MODE_RULE_RE = re.compile(
+    r'^hl\.workspace_rule\(\{ workspace = "(?P<selector>[^"]+)", layout = "master", '
+    r'layout_opts = \{ orientation = "center" \} \}\)$'
+)
+
+
+def mode_rule_text(selector: str) -> str:
+    """The rule the centred mode registers for a workspace, as a layouts file would hold it."""
+    return CENTER_MODE_RULE.format(selector=selector)
+
+
+def mode_file_selector(text: str) -> str | None:
+    """The workspace a leftover mode file names, or None when the text is not exactly the mode rule.
+
+    The mode is session-only now, so a file holding this rule can only come from the version that
+    persisted it. `apply` writes its own files with a header line, so a profile `layout: center` preset
+    (the same rule plus the header) never matches and is never deleted.
+    """
+    match = MODE_RULE_RE.match(text.strip())
+    return match.group("selector") if match else None
+
+
+def drop_mode_file(selector: str | None, file_key: str | None = None) -> str | None:
+    """Delete a workspace-layouts file holding exactly the mode rule; returns the path when it did.
+
+    With `selector` only, the file must be named after that workspace's key; with no selector, any file
+    in the directory whose content is a mode rule is a leftover. Anything else is left alone.
+    """
+    directory = workspace_layouts_dir()
+    if not os.path.isdir(directory):
+        return None
+    names = [f"{file_key}.lua"] if file_key else sorted(os.listdir(directory))
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            with open(path) as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        found = mode_file_selector(text)
+        if found is None or (selector is not None and found != selector):
+            continue
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        return path
+    return None
 
 
 CENTER_STATE_VERSION = 1
@@ -1860,23 +1889,49 @@ def drop_center_state(file_key: str) -> None:
         pass
 
 
-def persisted_rule_text(file_key: str) -> str | None:
-    path = os.path.join(workspace_layouts_dir(), f"{file_key}.lua")
-    try:
-        with open(path) as handle:
-            return handle.read()
-    except OSError:
+def prune_tree_to_classes(node: dict | None, classes: set[str]) -> dict | None:
+    """Drop the leaves of a recorded tree whose window is gone; None when nothing is left.
+
+    A window can close between the press that recorded the tree and the press that undoes it. The rest
+    of the arrangement is still worth rebuilding, so the tree is pruned instead of failing: surviving
+    children keep their shares (renormalised) and a node left with one child collapses into it.
+    """
+    if not node:
         return None
+    if "class" in node:
+        return {"class": node["class"]} if node["class"] in classes else None
+
+    children = node.get("children") or []
+    ratios = node.get("ratios") or []
+    kept: list[dict] = []
+    shares: list[float] = []
+    for index, child in enumerate(children):
+        pruned = prune_tree_to_classes(child, classes)
+        if pruned is None:
+            continue
+        kept.append(pruned)
+        shares.append(ratios[index] if index < len(ratios) else 1.0 / max(len(children), 1))
+    if not kept:
+        return None
+    if len(kept) == 1:
+        return kept[0]
+    out = {"split": node.get("split", "columns"), "children": kept}
+    if ratios:
+        total = sum(shares)
+        if total > 0:
+            out["ratios"] = [round(share / total, 4) for share in shares]
+    return out
 
 
 def center_snapshot(selector: str, file_key: str, area: tuple[int, int, int, int]) -> dict:
     """What the workspace looked like before the toggle turned it into a centred master.
 
-    `layout_opts` is always null: a snapshot is only taken when the workspace is NOT a centred master
-    (that state is what the toggle turns ON, and ON is idempotent there), so restoring the recorded
-    layout name alone reproduces the rule the workspace ran before. `node` is the tree `save` would
-    write; `dwindle_node` is the same arrangement in the binary shape dwindle can rebuild (null when
-    the arrangement is not a plain halving, e.g. after a manual resize).
+    The mode is session-only, so the snapshot is the only thing ON writes down: the layout name and the
+    arrangement, which OFF plays back. `layout_opts` is always null because a snapshot is only taken when
+    the workspace is NOT a centred master (that state is what the toggle turns ON, and ON is idempotent
+    there), so the recorded layout name alone reproduces the rule the workspace ran before. `node` is the
+    tree `save` would write; `dwindle_node` is the same arrangement in the binary shape dwindle can
+    rebuild (null when it is not a plain halving, e.g. after a manual resize).
     """
     rects = tiled_rects_on(selector)
     info = next(
@@ -1896,43 +1951,43 @@ def center_snapshot(selector: str, file_key: str, area: tuple[int, int, int, int
         "order": [client.get("class") for client, _ in rects],
         "node": save_node_from_rects(rects) if rects else None,
         "dwindle_node": dwindle_tree_from_rects(rects, area) if rects else None,
-        "persisted_text": persisted_rule_text(file_key),
     }
 
 
-def restore_persisted_rule(file_key: str, text: str | None) -> None:
-    """Put the workspace-layouts file back the way it was: the recorded text, or no file at all."""
-    path = os.path.join(workspace_layouts_dir(), f"{file_key}.lua")
-    if text is None:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        return
-    os.makedirs(workspace_layouts_dir(), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(tmp, path)
-
-
 def center_off(state: dict, selector: str, file_key: str, area: tuple[int, int, int, int], verbose: bool) -> int:
-    """Put a workspace back the way the toggle found it: recorded layout, arrangement and rule file."""
+    """Put a workspace back the way the toggle found it, and never fail hard.
+
+    Registers the recorded layout, rebuilds as much of the recorded arrangement as the windows still on
+    the workspace allow, and deletes a leftover mode file from the version that persisted the mode. The
+    layout is restored even when the arrangement cannot be: that is `restored-partial`, not `failed`.
+    """
     layout = state.get("layout") or "dwindle"
     if not eval_lua(f'hl.workspace_rule({{ workspace = "{selector}", layout = "{layout}" }})'):
+        log_line(f"center off ws {selector}: layout switch rejected", verbose)
         return 1
-    state_name = "restored"
-    if layout == "dwindle":
+
+    live = tiled_on(selector)
+    classes = {client.get("class") for client in live}
+    recorded = state.get("dwindle_node") or state.get("node")
+    node = prune_tree_to_classes(recorded, classes)
+    missing = sorted(set(state.get("order") or []) - classes)
+
+    state_name = "restored-partial" if missing else "restored"
+    detail = "missing " + ", ".join(missing) if missing else ""
+    if layout == "dwindle" and node:
         # dwindle rebuilds its tree from insertion order, so park the windows and put them back in the
-        # shape the snapshot recorded (the binary tree; the `save`-shaped one is the fallback). Other
-        # layouts lay themselves out once the rule is back: the custom provider places by class, and
-        # scrolling and master recalculate on their own.
-        node = state.get("dwindle_node") or state.get("node")
-        if node:
-            state_name = rebuild_workspace(selector, node, tiled_on(selector), area)
-    restore_persisted_rule(file_key, state.get("persisted_text"))
+        # shape the snapshot recorded. Other layouts lay themselves out once the rule is back: the
+        # custom provider places by class, and scrolling and master recalculate on their own.
+        rebuilt = rebuild_workspace(selector, node, live, area)
+        if rebuilt != "rebuilt":
+            state_name = "restored-partial"
+            detail = f"{detail + '; ' if detail else ''}rebuild {rebuilt}"
+
     drop_center_state(file_key)
-    log_line(f"center off ws {selector}: {state_name}", verbose)
+    log_line(
+        f"center off ws {selector}: {state_name}" + (f" ({detail})" if detail else ""),
+        verbose,
+    )
     return 0
 
 
@@ -1946,13 +2001,18 @@ def center_on(
     cursor: tuple[int, int] | None,
     verbose: bool,
 ) -> int:
-    """Switch a workspace to a centred master, make `target` the master, and record how to undo it."""
+    """Switch a workspace to a centred master, make `target` the master, and record how to undo it.
+
+    The mode is session-only: the rule goes to the compositor through `hyprctl eval` and nothing is
+    written to the workspace-layouts directory. Those files are read on every config load, so a persisted
+    mode file came back on a theme switch or a reload with no keypress (the reason this is session-only).
+    The persistent form of a centred workspace is the profile's `"layout": "center"`.
+    """
     snapshot = center_snapshot(selector, file_key, area)
     eval_lua(
         f'hl.workspace_rule({{ workspace = "{selector}", layout = "master", '
         f'layout_opts = {{ orientation = "center" }} }}); '
     )
-    persist_workspace_layout_omarchy_style(selector, file_key, "master", {"orientation": "center"})
     write_center_state(file_key, snapshot)
 
     tiled = [c for c in clients() if c.get("mapped") and not c.get("floating") and on_workspace(c, selector)]
@@ -2025,24 +2085,38 @@ def cmd_center(args) -> int:
         send_notification("Centre window: this workspace has no addressable rule target")
         return 0
     ws_selector, ws_file_key = target_ws
+    # A mode file left by the version that persisted the mode is never legitimate: it would put the
+    # workspace back into the mode on the next config load. Clear it whatever direction the press takes.
+    if drop_mode_file(ws_selector, ws_file_key):
+        log_line(f"center: dropped the persisted mode file for ws {ws_selector}", verbose)
     state = load_center_state(ws_file_key)
-
     mode = getattr(args, "mode", None)
-    if mode == "off" or (mode is None and state):
-        if not state:
-            log_line(f"center off ws {ws_selector}: not centred", verbose)
-            return 0
-        return center_off(state, ws_selector, ws_file_key, work_area(), verbose)
-    if state:
-        log_line(f"center on ws {ws_selector}: already centred", verbose)
-        return 0
 
     monitor = next((m for m in monitors_list if m.get("id") == target.get("monitor")), None)
     mid = workarea_mid_x(monitor)
     tiled = [c for c in clients_list if c.get("mapped") and not c.get("floating") and on_workspace(c, ws_selector)]
-    if is_centred_master(ws_selector, tiled, hyprctl_json("workspaces") or [], mid):
-        log_line(f"center on ws {ws_selector}: already centred", verbose)
-        return 0
+    centred = is_centred_master(ws_selector, tiled, hyprctl_json("workspaces") or [], mid)
+
+    if mode == "off":
+        if not state:
+            log_line(f"center off ws {ws_selector}: not centred", verbose)
+            return 0
+        return center_off(state, ws_selector, ws_file_key, work_area(), verbose)
+    if mode == "on":
+        if centred:
+            log_line(f"center on ws {ws_selector}: already centred", verbose)
+            return 0
+        return center_on(ws_selector, ws_file_key, target, monitor, mid, work_area(), cursor, verbose)
+
+    # The toggle reads the live state: a config reload drops the mode, so a snapshot on its own would
+    # turn a press into an OFF for a workspace that is no longer centred.
+    if centred:
+        if not state:
+            # Centred by something else (a profile preset, for instance) with nothing recorded to put
+            # back: leave it alone and say so once, with --verbose.
+            log_line(f"center off ws {ws_selector}: centred, nothing recorded", verbose)
+            return 0
+        return center_off(state, ws_selector, ws_file_key, work_area(), verbose)
     return center_on(ws_selector, ws_file_key, target, monitor, mid, work_area(), cursor, verbose)
 
 

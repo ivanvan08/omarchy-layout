@@ -240,7 +240,9 @@ workspace is created. Files left there by an older tool otherwise win and hand t
 or `scrolling`. Layout files are persisted only when running the default profile; with
 `OMARCHY_LAYOUT_PROFILE` set, rules apply at runtime only so temporary probe runs leave no files behind.
 When persisting, `apply` removes stale layout files carrying its header for workspaces no longer in the
-profile, while leaving unrelated files (such as Omarchy's layout toggles) untouched.
+profile, and a file holding exactly the centred-mode rule with no header (what the version that persisted
+`omarchy-layout center` wrote); unrelated files, such as Omarchy's layout toggles or our own centre preset
+(the same rule plus the header), are left untouched.
 
 ## Startup
 
@@ -331,9 +333,11 @@ To toggle a centred master on the hovered window (or the active window), add thi
 o.bind("SUPER + ALT + C", "Center window", "omarchy-layout center")
 ```
 
-Hovering a tiled window and pressing the shortcut switches the workspace to `master` layout with `orientation = "center"` (persisting the rule in `~/.local/state/omarchy/workspace-layouts/<ws>.lua`), centers the hovered window at full height, and arranges the remaining windows into side columns. Pressing it again on a side window swaps that window into the centre. The target is the tiled window under the cursor on the cursor's monitor (a shown special workspace wins); hovering a floating window does nothing but notify, and hovering a gap falls back to the focused window. The cursor and the visible workspace are never moved. Workspaces with fewer than three windows keep the empty space (`master:slave_count_for_center_master` is 0), a fourth window stacks under the second and a fifth under the third.
+Hovering a tiled window and pressing the shortcut switches the workspace to `master` layout with `orientation = "center"`, centers the hovered window at full height, and arranges the remaining windows into side columns. Pressing it again on a side window swaps that window into the centre. The target is the tiled window under the cursor on the cursor's monitor (a shown special workspace wins); hovering a floating window does nothing but notify, and hovering a gap falls back to the focused window. The cursor and the visible workspace are never moved. Workspaces with fewer than three windows keep the empty space (`master:slave_count_for_center_master` is 0), a fourth window stacks under the second and a fifth under the third.
 
-The same command works on the scratchpad: a special workspace is addressed by its **name** (`workspace = "special:scratchpad"`), never by its negative id, which Hyprland would read as the relative form and resolve to another workspace; its rule is persisted under a name-safe file (`special-scratchpad.lua`).
+The same command works on the scratchpad: a special workspace is addressed by its **name** (`workspace = "special:scratchpad"`), never by its negative id, which Hyprland would read as the relative form and resolve to another workspace.
+
+The mode is **per session**: the rule goes to the compositor through `hyprctl eval` and nothing is written to `~/.local/state/omarchy/workspace-layouts/`. Those files are read on every config load, so a persisted mode file made a *theme switch* (which runs `omarchy-restart-hyprctl` -> `hyprctl reload`) or `omarchy refresh` put the workspace back into centred mode with no keypress - the reason it is session-only now. Anything a reload brings back has to be in the profile instead; the persistent form of a centred workspace is `"layout": "center"` on a workspace node.
 
 ### It is a toggle
 
@@ -341,19 +345,27 @@ The same command works on the scratchpad: a special workspace is addressed by it
 the first one. `--on` and `--off` ask for one direction explicitly.
 
 What ON records, before it changes anything, in `~/.local/state/omarchy/layout/center-<session>-<key>.json`:
-the layout name the workspace ran, the window order, the arrangement as a tree (`node`, the shape
-`omarchy-layout save` writes, plus `dwindle_node`, the binary shape dwindle can rebuild), and the exact
-text of the workspace-layouts file. OFF re-registers the recorded layout, rebuilds the recorded
-arrangement (park + insert in order for `dwindle`; the custom provider, `scrolling` and `master` lay
-themselves out once the rule is back), restores the rule file byte for byte (or removes it when there was
-none) and deletes the snapshot.
+the layout name the workspace ran, the window order, and the arrangement as a tree (`node`, the shape
+`omarchy-layout save` writes, plus `dwindle_node`, the binary shape dwindle can rebuild). OFF re-registers
+the recorded layout and rebuilds the recorded arrangement (park + insert in order for `dwindle`; the custom
+provider, `scrolling` and `master` lay themselves out once the rule is back), then deletes the snapshot.
+It reports:
 
+| State | Meaning |
+| :--- | :--- |
+| `restored` | the recorded layout is back and the recorded arrangement was reproduced |
+| `restored-partial` | the layout is back but the arrangement could only be partly reproduced (a recorded window closed meanwhile, or dwindle could not build the recorded tree); the log names what is missing |
+
+- OFF never fails hard: a window that closed while the mode was on is dropped from the recorded tree and
+  the rest is rebuilt.
 - `--on` on a workspace that is already a centred master does nothing; `--off` on a workspace with no
   snapshot does nothing. Both exit 0.
-- A workspace that is already a centred master is never recorded, so `SUPER + L` (or `--off`) is the way
-  out for one you did not create with this command (a profile centre preset, for instance).
+- A workspace that is already a centred master is never recorded, so `SUPER + L` is the way out for one
+  you did not create with this command (a profile centre preset, for instance).
 - The snapshot is per Hyprland session; `apply` deletes snapshots left by earlier sessions, like the
-  `assembled-*` flags.
+  `assembled-*` flags. `apply` also deletes a leftover mode file from the version that persisted the mode
+  (a file holding exactly the mode rule and no header), so a poisoned file cannot come back at login; a
+  profile centre preset (the same rule plus our header) is left alone.
 - `apply` at login re-asserts the profile layout for profile workspaces, and its late-arrival watch runs
   for up to `--watch-cap` (60 s by default), rebuilding a profile workspace's tree if it does not match
   the profile. Pressing the toggle inside that window on a profile workspace can therefore be undone by
@@ -390,8 +402,6 @@ column keeps its middle (`mfact` changes).
 
 The escape from every caveat is the toggle itself: the second press restores the previous layout, where
 dragging is unlimited (dwindle, or whatever the workspace ran before).
-
-Unlike the persisted rule `apply` writes at login, the rule this command writes carries no `omarchy-layout` header, matching Omarchy's own layout toggle; `apply` rewrites the file (with the header) on the next login.
 
 Known issue (upstream, not fixed here): Omarchy's own `omarchy-hyprland-workspace-layout-toggle` (bound to `SUPER + L`) names its state file after the workspace **id**, so toggling the layout while a special workspace is shown writes a poisonous `-<id>.lua` (e.g. `-98.lua`) that Hyprland resolves to workspace 1 on every config load. `omarchy-layout center` avoids this; `SUPER + L` on a special workspace does not.
 

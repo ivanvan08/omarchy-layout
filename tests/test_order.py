@@ -3,7 +3,9 @@
 Run: python3 -m unittest tests/test_order.py
 """
 
+import contextlib
 import importlib.util
+import io
 import itertools
 import json
 import os
@@ -355,6 +357,37 @@ class WorkspaceLayoutPersistence(unittest.TestCase):
         self.assertTrue(os.path.exists(foreign_path))
         self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "1.lua")))
 
+    def test_a_leftover_mode_file_is_pruned_and_a_preset_is_kept(self):
+        cli.PROFILE_PATH = None
+        if "OMARCHY_LAYOUT_PROFILE" in os.environ:
+            del os.environ["OMARCHY_LAYOUT_PROFILE"]
+
+        # What the version that persisted the mode wrote: the mode rule, no header. For a workspace the
+        # profile names (2) and one it does not (special-scratchpad).
+        for name, selector in (("2.lua", "2"), ("special-scratchpad.lua", "special:scratchpad")):
+            with open(os.path.join(self.tmp.name, name), "w") as f:
+                f.write(cli.mode_rule_text(selector) + "\n")
+        # A profile centre preset: our header plus the same rule - a legitimate persistent layout.
+        preset = os.path.join(self.tmp.name, "3.lua")
+        with open(preset, "w") as f:
+            f.write("-- written by omarchy-layout - https://github.com/ivanvan08/omarchy-layout\n")
+            f.write(cli.mode_rule_text("3") + "\n")
+
+        profile = {"workspaces": {"3": {"layout": "center", "split": "columns", "children": []}}}
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            cli.write_workspace_layouts(profile, "external", dry_run=True)
+        self.assertIn("2.lua", printed.getvalue())
+        self.assertIn("special-scratchpad.lua", printed.getvalue())
+        self.assertNotIn("3.lua", printed.getvalue())
+        self.assertEqual(sorted(os.listdir(self.tmp.name)),
+                         ["2.lua", "3.lua", "special-scratchpad.lua"], "dry-run deletes nothing")
+
+        cli.write_workspace_layouts(profile, "external", dry_run=False)
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["3.lua"], "the preset must survive")
+        with open(preset) as handle:
+            self.assertIn(cli.mode_rule_text("3"), handle.read())
+
 
 
 class CenterCommandSelection(unittest.TestCase):
@@ -664,17 +697,18 @@ class CenterToggle(unittest.TestCase):
         for lua in self.evals:
             self.assertIsNone(re.search(r"-\d", lua), lua)
 
-    def test_the_written_rule_has_no_negative_number_anywhere(self):
+    def test_the_live_rule_has_no_negative_number_and_nothing_is_persisted(self):
         self.run_center()
-        self.assertEqual(self.layout_files(), [f"{SPECIAL.replace(':', '-')}.lua"], self.layout_files())
-        for name in self.layout_files():
-            self.assertFalse(name.startswith("-"), name)
-        with open(os.path.join(self.layouts_dir, self.layout_files()[0])) as handle:
-            text = handle.read()
-        self.assertIn(f'workspace = "{SPECIAL}"', text)
-        self.assertIn('layout = "master"', text)
-        self.assertIn('orientation = "center"', text)
-        self.assertIsNone(re.search(r"-\d", text), text)
+        # The mode is session-only: nothing may land in the workspace-layouts directory, because every
+        # config load reads it (that is how a theme switch revived the mode with no keypress).
+        self.assertEqual(self.layout_files(), [], self.layout_files())
+        rules = [lua for lua in self.evals if "workspace_rule" in lua]
+        self.assertEqual(len(rules), 1, self.evals)
+        self.assertIn(f'workspace = "{SPECIAL}"', rules[0])
+        self.assertIn('layout = "master"', rules[0])
+        self.assertIn('orientation = "center"', rules[0])
+        for lua in self.evals:
+            self.assertIsNone(re.search(r"-\d", lua), lua)
 
     def test_on_records_the_previous_state_and_off_puts_it_back(self):
         self.run_center()
@@ -687,8 +721,8 @@ class CenterToggle(unittest.TestCase):
         self.assertEqual(state["selector"], SPECIAL)
         self.assertEqual(state["layout_opts"], None)
         self.assertEqual(state["order"], ["A", "B", "C"])
-        self.assertEqual(state["persisted_text"], None)
         self.assertEqual(state["node"]["children"][0]["class"], "A")
+        self.assertEqual(self.layout_files(), [], self.layout_files())
 
         before = len(self.evals)
         self.run_center()
@@ -736,18 +770,125 @@ class CenterToggle(unittest.TestCase):
         self.assertEqual(self.evals, [])
         self.assertEqual(self.state_files(), [])
 
-    def test_off_restores_the_rule_file_a_profile_workspace_had(self):
-        original = '-- written by omarchy-layout\nhl.workspace_rule({ workspace = "special:scratchpad", layout = "dwindle" })\n'
+    def test_a_press_after_a_reload_turns_the_mode_on_again(self):
+        self.run_center()  # mode ON, snapshot written
+        # A config reload (theme switch, omarchy refresh, hyprctl reload) drops the mode but leaves the
+        # snapshot behind; the next press must read the live state and centre again.
+        self.mastered = False
+        self.layouts = [{"id": -98, "name": SPECIAL, "tiledLayout": "dwindle"}]
+        before = len(self.evals)
+
+        self.assertEqual(self.run_center(), 0)
+        rules = [lua for lua in self.evals[before:] if "workspace_rule" in lua]
+        self.assertEqual(len(rules), 1, self.evals[before:])
+        self.assertIn('layout = "master"', rules[0])
+        self.assertEqual(len(self.state_files()), 1)
+
+    def test_a_press_on_a_centred_workspace_with_nothing_recorded_does_nothing(self):
+        # A profile centre preset (or a workspace centred by something else) has no recorded state to
+        # put back, so a press leaves it alone.
+        self.mastered = True
+        self.layouts = [{"id": -98, "name": SPECIAL, "tiledLayout": "master"}]
+        self.assertEqual(self.run_center(), 0)
+        self.assertEqual(self.evals, [])
+        self.assertEqual(self.state_files(), [])
+
+    def test_off_deletes_a_leftover_mode_file_and_keeps_a_real_one(self):
+        # The version that persisted the mode left a headerless mode rule here; OFF must clear it so a
+        # reload cannot bring the mode back.
+        real = '-- written by omarchy-layout\nhl.workspace_rule({ workspace = "special:scratchpad", layout = "dwindle" })\n'
         path = os.path.join(self.layouts_dir, "special-scratchpad.lua")
         with open(path, "w") as handle:
-            handle.write(original)
+            handle.write(real)
         self.run_center("on")
         with open(path) as handle:
-            self.assertIn('layout = "master"', handle.read())
+            self.assertEqual(handle.read(), real, "ON must not touch the layouts directory")
         self.run_center("off")
         with open(path) as handle:
-            self.assertEqual(handle.read(), original)
+            self.assertEqual(handle.read(), real, "OFF must keep a rule it did not write")
+
+        with open(path, "w") as handle:
+            handle.write(cli.mode_rule_text(SPECIAL) + "\n")
+        self.assertEqual(self.run_center("off"), 0)
+        self.assertEqual(self.layout_files(), [], "OFF must drop a leftover mode file")
         self.assertEqual(self.state_files(), [])
+
+    def test_drop_mode_file_only_touches_the_mode_rule(self):
+        mode = os.path.join(self.layouts_dir, "special-scratchpad.lua")
+        foreign = os.path.join(self.layouts_dir, "special-other.lua")
+        ours = os.path.join(self.layouts_dir, "3.lua")
+        with open(mode, "w") as handle:
+            handle.write(cli.mode_rule_text(SPECIAL) + "\n")
+        with open(foreign, "w") as handle:
+            handle.write('hl.workspace_rule({ workspace = "special:other", layout = "dwindle" })\n')
+        with open(ours, "w") as handle:
+            handle.write(f"-- written by omarchy-layout\n{cli.mode_rule_text('3')}\n")
+
+        self.assertIsNone(cli.drop_mode_file(SPECIAL, "special-other"), "the wrong selector must not match")
+        self.assertEqual(cli.mode_file_selector(cli.mode_rule_text("3") + "\n"), "3")
+        self.assertIsNone(cli.mode_file_selector(f"-- written by omarchy-layout\n{cli.mode_rule_text('3')}\n"))
+        self.assertEqual(sorted(cli.os.listdir(self.layouts_dir)),
+                         ["3.lua", "special-other.lua", "special-scratchpad.lua"])
+
+        self.assertEqual(cli.drop_mode_file(SPECIAL, "special-scratchpad"), mode)
+        self.assertEqual(cli.drop_mode_file(None), None, "the remaining files are not mode files")
+        self.assertEqual(sorted(cli.os.listdir(self.layouts_dir)), ["3.lua", "special-other.lua"])
+
+    def test_prune_tree_drops_the_leaves_whose_window_is_gone(self):
+        tree = {
+            "split": "columns",
+            "children": [
+                {"split": "columns", "children": [{"class": "A"}, {"class": "GONE"}]},
+                {"class": "C"},
+            ],
+        }
+        self.assertEqual(
+            cli.prune_tree_to_classes(tree, {"A", "C"}),
+            {"split": "columns", "children": [{"class": "A"}, {"class": "C"}]},
+        )
+        self.assertEqual(
+            cli.prune_tree_to_classes(tree, {"A"}),
+            {"class": "A"},  # a node left with one child is just that child's box
+        )
+        self.assertIsNone(cli.prune_tree_to_classes(tree, set()))
+        self.assertIsNone(cli.prune_tree_to_classes(None, {"A"}))
+        with_ratios = {
+            "split": "rows",
+            "ratios": [0.2, 0.5, 0.3],
+            "children": [{"class": "A"}, {"class": "GONE"}, {"class": "C"}],
+        }
+        self.assertEqual(
+            cli.prune_tree_to_classes(with_ratios, {"A", "C"}),
+            {"split": "rows", "ratios": [0.4, 0.6], "children": [{"class": "A"}, {"class": "C"}]},
+        )
+
+    def log_text(self) -> str:
+        try:
+            with open(os.path.join(self.state_dir, "log")) as handle:
+                return handle.read()
+        except OSError:
+            return ""
+
+    def test_off_with_a_window_that_closed_is_partial_not_failed(self):
+        # The recorded tree names A, B and C; B closes while the mode is on.
+        self.run_center()
+        log_before = len(self.log_text())
+        cli.clients = lambda: [dict(c) for c in SPECIAL_AFTER if c["class"] != "B"]
+        self.rebuilds.clear()
+
+        before = len(self.evals)
+        self.assertEqual(self.run_center("off"), 0)
+        rules = [lua for lua in self.evals[before:] if "workspace_rule" in lua]
+        self.assertEqual(len(rules), 1, self.evals[before:])
+        self.assertIn('layout = "dwindle"', rules[0], "the layout must be restored regardless")
+        self.assertEqual(len(self.rebuilds), 1, self.rebuilds)
+        self.assertNotIn("B", json.dumps(self.rebuilds[0][1]))
+        line = self.log_text()[log_before:].strip()
+        self.assertIn("restored-partial", line, line)
+        self.assertIn("missing B", line, line)
+        self.assertNotIn("failed", line, line)
+        self.assertEqual(self.state_files(), [])
+        self.assertEqual(self.layout_files(), [], "the leftover mode file is dropped either way")
 
     def test_stale_state_of_other_sessions_is_pruned(self):
         other = os.path.join(self.state_dir, "center-other-session-special-scratchpad.json")
@@ -833,13 +974,15 @@ class CenterOnNormalWorkspace(unittest.TestCase):
         ) = self.saved
         self.tmp.cleanup()
 
-    def test_a_numbered_workspace_keeps_its_numeric_key_and_restores_its_rule_file(self):
+    def test_a_numbered_workspace_keeps_its_numeric_key_and_leaves_the_rule_file_alone(self):
         cli.cmd_center(self.argparse.Namespace(mode=None, verbose=False))
         self.assertEqual(sorted(os.listdir(self.layouts_dir)), ["2.lua"])
         with open(self.rule_path) as handle:
-            self.assertIn('layout = "master"', handle.read())
+            self.assertEqual(handle.read(), self.original, "ON must not touch the layouts directory")
         self.assertEqual(sorted(n for n in os.listdir(self.state_dir) if n.startswith("center-")),
                          ["center-test-session-2.json"])
+        rules = [lua for lua in self.evals if "workspace_rule" in lua]
+        self.assertEqual(rules[-1], 'hl.workspace_rule({ workspace = "2", layout = "master", layout_opts = { orientation = "center" } }); ')
 
         cli.cmd_center(self.argparse.Namespace(mode="off", verbose=False))
         with open(self.rule_path) as handle:
@@ -847,6 +990,12 @@ class CenterOnNormalWorkspace(unittest.TestCase):
         self.assertEqual([n for n in os.listdir(self.state_dir) if n.startswith("center-")], [])
         rules = [lua for lua in self.evals if "workspace_rule" in lua]
         self.assertEqual(rules[-1], 'hl.workspace_rule({ workspace = "2", layout = "dwindle" })')
+
+    def test_a_leftover_mode_file_for_a_numbered_workspace_is_dropped_on_a_press(self):
+        with open(self.rule_path, "w") as handle:
+            handle.write(cli.mode_rule_text("2") + "\n")
+        cli.cmd_center(self.argparse.Namespace(mode="off", verbose=False))
+        self.assertEqual(os.listdir(self.layouts_dir), [], "a stale mode file must not survive a press")
 
 
 if __name__ == "__main__":
