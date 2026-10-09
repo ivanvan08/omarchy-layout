@@ -354,5 +354,169 @@ class WorkspaceLayoutPersistence(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "1.lua")))
 
 
+
+class CenterCommandSelection(unittest.TestCase):
+    def setUp(self):
+        self.monitors = [
+            {
+                "id": 0,
+                "name": "Virtual-1",
+                "x": 0,
+                "y": 0,
+                "width": 3200,
+                "height": 900,
+                "scale": 1.0,
+                "activeWorkspace": {"id": 2, "name": "2"},
+                "specialWorkspace": {"id": 0, "name": ""},
+            }
+        ]
+        self.tiled_left = {
+            "address": "0x101",
+            "class": "Left",
+            "at": [12, 42],
+            "size": [786, 846],
+            "workspace": {"id": 2, "name": "2"},
+            "floating": False,
+            "mapped": True,
+        }
+        self.tiled_center = {
+            "address": "0x102",
+            "class": "Center",
+            "at": [812, 42],
+            "size": [1576, 846],
+            "workspace": {"id": 2, "name": "2"},
+            "floating": False,
+            "mapped": True,
+        }
+        self.tiled_right = {
+            "address": "0x103",
+            "class": "Right",
+            "at": [2402, 42],
+            "size": [786, 846],
+            "workspace": {"id": 2, "name": "2"},
+            "floating": False,
+            "mapped": True,
+        }
+        self.clients = [self.tiled_left, self.tiled_center, self.tiled_right]
+
+    def test_hover_inside_tiled_window(self):
+        cursor = (2500, 200)  # inside tiled_right
+        target, err = cli.find_target_window(cursor, self.clients, self.monitors, None)
+        self.assertIsNone(err)
+        self.assertEqual(target, self.tiled_right)
+
+    def test_hover_in_gap_falls_back_to_active(self):
+        cursor = (805, 200)  # in gap between 798 and 812
+        active = self.tiled_left
+        target, err = cli.find_target_window(cursor, self.clients, self.monitors, active)
+        self.assertIsNone(err)
+        self.assertEqual(target, self.tiled_left)
+
+    def test_hover_in_gap_with_no_active_window(self):
+        cursor = (805, 200)  # in gap
+        target, err = cli.find_target_window(cursor, self.clients, self.monitors, None)
+        self.assertEqual(err, "none")
+        self.assertIsNone(target)
+
+    def test_floating_window_on_top_returns_floating_error(self):
+        floating = {
+            "address": "0x201",
+            "class": "Float",
+            "at": [900, 100],
+            "size": [400, 300],
+            "workspace": {"id": 2, "name": "2"},
+            "floating": True,
+            "mapped": True,
+        }
+        clients = [self.tiled_left, self.tiled_center, self.tiled_right, floating]
+        cursor = (1000, 200)  # inside floating window (and inside tiled_center)
+        target, err = cli.find_target_window(cursor, clients, self.monitors, None)
+        self.assertEqual(err, "floating")
+        self.assertIsNone(target)
+
+    def test_shown_special_workspace_takes_precedence(self):
+        special_monitors = [
+            {
+                "id": 0,
+                "name": "Virtual-1",
+                "x": 0,
+                "y": 0,
+                "width": 3200,
+                "height": 900,
+                "scale": 1.0,
+                "activeWorkspace": {"id": 2, "name": "2"},
+                "specialWorkspace": {"id": -99, "name": "special:scratchpad"},
+            }
+        ]
+        special_window = {
+            "address": "0x301",
+            "class": "Special",
+            "at": [812, 42],
+            "size": [1576, 846],
+            "workspace": {"id": -99, "name": "special:scratchpad"},
+            "floating": False,
+            "mapped": True,
+        }
+        clients = self.clients + [special_window]
+        cursor = (1000, 200)  # inside both special_window and tiled_center
+        target, err = cli.find_target_window(cursor, clients, special_monitors, None)
+        self.assertIsNone(err)
+        self.assertEqual(target, special_window)
+
+    def test_identify_master_window(self):
+        workarea_mid_x = 1600.0
+        # 1 window
+        self.assertEqual(cli.identify_master_window([self.tiled_center], workarea_mid_x), self.tiled_center)
+
+        # 2 windows (center and left)
+        two_wins = [self.tiled_left, self.tiled_center]
+        self.assertEqual(cli.identify_master_window(two_wins, workarea_mid_x), self.tiled_center)
+
+        # 3 windows (left, center, right)
+        self.assertEqual(cli.identify_master_window(self.clients, workarea_mid_x), self.tiled_center)
+
+        # 4 windows (stacked sides)
+        w4_top_left = {
+            "address": "0x401", "class": "TL", "at": [12, 42], "size": [786, 416],
+            "workspace": {"id": 2, "name": "2"}, "floating": False, "mapped": True,
+        }
+        w4_bot_left = {
+            "address": "0x402", "class": "BL", "at": [12, 472], "size": [786, 416],
+            "workspace": {"id": 2, "name": "2"}, "floating": False, "mapped": True,
+        }
+        four_wins = [w4_top_left, w4_bot_left, self.tiled_center, self.tiled_right]
+        self.assertEqual(cli.identify_master_window(four_wins, workarea_mid_x), self.tiled_center)
+
+        # 5 windows
+        w5_bot_right = {
+            "address": "0x501", "class": "BR", "at": [2402, 472], "size": [786, 416],
+            "workspace": {"id": 2, "name": "2"}, "floating": False, "mapped": True,
+        }
+        five_wins = [w4_top_left, w4_bot_left, self.tiled_center, self.tiled_right, w5_bot_right]
+        self.assertEqual(cli.identify_master_window(five_wins, workarea_mid_x), self.tiled_center)
+
+    def test_swap_plan(self):
+        # Target already master -> no swap
+        self.assertEqual(cli.plan_center_swap(self.tiled_center, self.tiled_center), [])
+
+        # Target is side window -> swap with master
+        swaps = cli.plan_center_swap(self.tiled_right, self.tiled_center)
+        self.assertEqual(swaps, [("0x103", "0x102")])
+
+    def test_workarea_mid_x_accounts_for_scale_and_reserved_area(self):
+        monitor = {"x": 0, "width": 5120, "scale": 2, "reserved": [12, 30, 12, 0]}
+        # logical width 2560, work area 12..2548, middle 1280
+        self.assertEqual(cli.workarea_mid_x(monitor), 1280.0)
+        self.assertEqual(cli.workarea_mid_x({"x": 3200, "width": 1920, "scale": 1}), 4160.0)
+        self.assertEqual(cli.workarea_mid_x(None), 0.0)
+
+    def test_is_centered_uses_the_shape_tolerance(self):
+        mid = 1600.0
+        self.assertTrue(cli.is_centered(self.tiled_center, mid))  # 812 + 1576/2 = 1600
+        offset = dict(self.tiled_center, at=[840, 42])
+        self.assertTrue(cli.is_centered(offset, mid))  # 28 px off, inside the 32 px tolerance
+        off = dict(self.tiled_center, at=[900, 42])
+        self.assertFalse(cli.is_centered(off, mid))  # 88 px off
+
 if __name__ == "__main__":
     unittest.main()

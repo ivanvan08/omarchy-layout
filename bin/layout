@@ -23,6 +23,7 @@ import math
 import os
 import re
 import select
+import shutil
 import socket
 import subprocess
 import sys
@@ -1529,6 +1530,242 @@ def cmd_order(args) -> int:
     return status
 
 
+
+# --------------------------------------------------------------------------- center command
+
+def send_notification(headline: str, description: str = "", glyph: str = "󱂬") -> None:
+    bin_path = shutil.which("omarchy-notification-send")
+    if not bin_path:
+        return
+    cmd = [bin_path, "-g", glyph, headline]
+    if description:
+        cmd.append(description)
+    try:
+        subprocess.run(cmd, check=False)
+    except OSError:
+        pass
+
+
+def find_target_window(
+    cursor: tuple[int, int] | None,
+    clients_list: list[dict],
+    monitors_list: list[dict],
+    active_window: dict | None,
+) -> tuple[dict | None, str | None]:
+    """Identify the target tiled window to center.
+
+    Returns (target, error).
+    - If cursor is inside a floating window on the visible workspace, returns (None, 'floating').
+    - If cursor is inside a tiled window on the visible workspace (special workspace first),
+      returns (window, None).
+    - If cursor is over a gap/empty area, falls back to the active tiled window:
+      returns (active_window, None) if active is tiled and mapped, else (None, 'none').
+    """
+    if cursor is not None and monitors_list:
+        cx, cy = cursor
+        target_monitor = None
+        for m in monitors_list:
+            if m.get("disabled"):
+                continue
+            mx, my = m.get("x", 0), m.get("y", 0)
+            scale = m.get("scale", 1.0) or 1.0
+            mw = int(m.get("width", 0) / scale)
+            mh = int(m.get("height", 0) / scale)
+            if mx <= cx < mx + mw and my <= cy < my + mh:
+                target_monitor = m
+                break
+        if target_monitor is None:
+            target_monitor = next((m for m in monitors_list if not m.get("disabled")), monitors_list[0])
+
+        shown_ws_name = None
+        shown_ws_id = None
+        spec = target_monitor.get("specialWorkspace") or {}
+        if spec.get("id", 0) != 0 or spec.get("name"):
+            shown_ws_id = spec.get("id")
+            shown_ws_name = spec.get("name")
+        else:
+            active_ws = target_monitor.get("activeWorkspace") or {}
+            shown_ws_id = active_ws.get("id")
+            shown_ws_name = active_ws.get("name")
+
+        def on_visible_ws(c: dict) -> bool:
+            ws_info = c.get("workspace") or {}
+            c_ws_id = ws_info.get("id")
+            c_ws_name = ws_info.get("name")
+            if shown_ws_id is not None and c_ws_id == shown_ws_id:
+                return True
+            if shown_ws_name and (c_ws_name == shown_ws_name or str(c_ws_id) == str(shown_ws_name)):
+                return True
+            return False
+
+        visible_clients = [c for c in clients_list if c.get("mapped") and on_visible_ws(c)]
+
+        # Check floating windows first (floating windows sit on top)
+        for c in visible_clients:
+            if c.get("floating"):
+                x, y = c.get("at", [0, 0])
+                w, h = c.get("size", [0, 0])
+                if x <= cx < x + w and y <= cy < y + h:
+                    return None, "floating"
+
+        # Check tiled windows under cursor
+        for c in visible_clients:
+            if not c.get("floating"):
+                x, y = c.get("at", [0, 0])
+                w, h = c.get("size", [0, 0])
+                if x <= cx < x + w and y <= cy < y + h:
+                    return c, None
+
+    # Fallback to focused/active window
+    if active_window and active_window.get("mapped"):
+        if active_window.get("floating"):
+            return None, "floating"
+        return active_window, None
+
+    return None, "none"
+
+
+def identify_master_window(
+    tiled_windows: list[dict],
+    workarea_mid_x: float,
+) -> dict | None:
+    """Find the current master window in master layout with orientation=center.
+
+    Under orientation=center, the master window's horizontal midpoint (x + w / 2)
+    is centered in the monitor work area.
+    """
+    if not tiled_windows:
+        return None
+    if len(tiled_windows) == 1:
+        return tiled_windows[0]
+    return min(
+        tiled_windows,
+        key=lambda w: abs((w.get("at", [0, 0])[0] + w.get("size", [0, 0])[0] / 2.0) - workarea_mid_x),
+    )
+
+
+def plan_center_swap(
+    target_window: dict,
+    current_master: dict,
+) -> list[tuple[str, str]]:
+    """Determine swap required to make target_window the master.
+
+    Returns [(target_address, master_address)] if target is not already master,
+    or [] if target is already the master window.
+    """
+    target_addr = norm_address(str(target_window.get("address") or ""))
+    master_addr = norm_address(str(current_master.get("address") or ""))
+    if target_addr == master_addr:
+        return []
+    return [(target_addr, master_addr)]
+
+
+def persist_workspace_layout_omarchy_style(
+    workspace: str, layout: str, layout_opts: dict | None = None
+) -> str | None:
+    """Persist workspace rule Omarchy-style without omarchy-layout header.
+
+    Omarchy's layout toggle writes directly to ~/.local/state/omarchy/workspace-layouts/<ws>.lua
+    without a header. Writing the same format ensures the rule survives config reloads and
+    is never deleted by omarchy-layout's stale-rule pruning.
+    """
+    if not (workspace.isdigit() or (workspace.startswith("-") and workspace[1:].isdigit())):
+        return None
+
+    directory = workspace_layouts_dir()
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{workspace}.lua")
+
+    if layout_opts:
+        opts_lua = ", ".join(
+            f'{k} = "{v}"' if isinstance(v, str) else f"{k} = {v}"
+            for k, v in layout_opts.items()
+        )
+        rule_lua = f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}", layout_opts = {{ {opts_lua} }} }})'
+    else:
+        rule_lua = f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}" }})'
+
+    text = f"{rule_lua}\n"
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+    return path
+
+
+def workarea_mid_x(monitor: dict | None) -> float:
+    """Horizontal middle of a monitor's work area in layout coordinates (reserved edges excluded)."""
+    if not monitor:
+        return 0.0
+    scale = monitor.get("scale") or 1.0
+    width = monitor.get("width", 0) / scale
+    left, _top, right, _bottom = (monitor.get("reserved") or [0, 0, 0, 0])[:4]
+    return monitor.get("x", 0) + left + (width - left - right) / 2.0
+
+
+def is_centered(window: dict, mid_x: float, tolerance: float = SHAPE_TOLERANCE) -> bool:
+    x, w = window.get("at", [0, 0])[0], window.get("size", [0, 0])[0]
+    return abs(x + w / 2.0 - mid_x) <= tolerance
+
+
+def cmd_center(args) -> int:
+    """Put the hovered tiled window (or the focused one) in the middle of its workspace.
+
+    The workspace runs Hyprland's master layout with orientation center: the master is the middle
+    column and the other windows alternate left/right, stacking per side. A workspace that does not
+    show a centred master yet gets the rule at runtime (the rule takes effect within the same
+    `hyprctl eval`, so the geometry read next is already the master one) and is persisted
+    Omarchy-style. The target then swaps with the current master. `hl.dsp.window.swap` warps the
+    cursor to the swapped window, so the same eval puts the cursor back where it was.
+    """
+    cursor = cursor_position()
+    monitors_list = hyprctl_json("monitors") or []
+    active_win = hyprctl_json("activewindow") or None
+    clients_list = clients()
+
+    target, err = find_target_window(cursor, clients_list, monitors_list, active_win)
+    if err == "floating":
+        send_notification("Centre window: floating windows are not tiled")
+        return 0
+    if not target:
+        return 0
+
+    ws_info = target.get("workspace") or {}
+    ws_key = str(ws_info.get("id")) if ws_info.get("id") is not None else str(ws_info.get("name"))
+    monitor = next((m for m in monitors_list if m.get("id") == target.get("monitor")), None)
+    mid = workarea_mid_x(monitor)
+
+    def tiled_here(items: list[dict]) -> list[dict]:
+        return [c for c in items if c.get("mapped") and not c.get("floating") and on_workspace(c, ws_key)]
+
+    tiled = tiled_here(clients_list)
+    workspaces = hyprctl_json("workspaces") or []
+    info = next((w for w in workspaces if str(w.get("id")) == ws_key or w.get("name") == ws_key), {})
+    master = identify_master_window(tiled, mid)
+    if info.get("tiledLayout") != "master" or not (master and is_centered(master, mid)):
+        eval_lua(
+            f'hl.workspace_rule({{ workspace = "{ws_key}", layout = "master", '
+            f'layout_opts = {{ orientation = "center" }} }}); '
+        )
+        persist_workspace_layout_omarchy_style(ws_key, "master", {"orientation": "center"})
+        tiled = tiled_here(clients())
+        master = identify_master_window(tiled, mid)
+
+    if not master:
+        return 0
+    swaps = plan_center_swap(target, master)
+    if not swaps:
+        return 0
+    lua = "".join(
+        f'hl.dispatch(hl.dsp.window.swap({{ window = "address:{a}", target = "address:{b}" }})); '
+        for a, b in swaps
+    )
+    if cursor:
+        lua += f"hl.dispatch(hl.dsp.cursor.move({{ x = {cursor[0]}, y = {cursor[1]} }}))"
+    eval_lua(lua)
+    return 0
+
+
 def cmd_list(args) -> int:
     profile = load_profile()
     for workspace, leaves_ in sorted(workspace_leaves(profile).items(), key=lambda kv: float(kv[0])):
@@ -1572,6 +1809,7 @@ def main(argv=None) -> int:
     order_parser.add_argument("--check", action="store_true", help="report only, move nothing")
     order_parser.add_argument("--verbose", action="store_true")
 
+    sub.add_parser("center", help="center the hovered or active window using master layout")
     args = parser.parse_args(argv)
     handler = {
         "apply": cmd_apply,
@@ -1580,6 +1818,7 @@ def main(argv=None) -> int:
         "save": cmd_save,
         "list": cmd_list,
         "order": cmd_order,
+        "center": cmd_center,
     }[args.command]
     try:
         return handler(args)

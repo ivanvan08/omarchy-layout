@@ -413,6 +413,10 @@ check("center: apply can reach both rule sets", #(omarchy_layout_rules.park["4"]
 check("center: module sets master:mfact", configs[#configs] ~= nil and configs[#configs].master ~= nil
   and configs[#configs].master.mfact == 0.5,
   configs[#configs] and configs[#configs].master and tostring(configs[#configs].master.mfact) or "no mfact")
+check("center: module sets slave_count_for_center_master = 0",
+  configs[#configs] ~= nil and configs[#configs].master ~= nil
+  and configs[#configs].master.slave_count_for_center_master == 0,
+  configs[#configs] and configs[#configs].master and tostring(configs[#configs].master.slave_count_for_center_master) or "no slave count")
 
 local handle_flag_4 = assert(io.open(flag_4, "w"))
 handle_flag_4:write("assembled\n")

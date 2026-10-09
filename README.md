@@ -174,6 +174,7 @@ omarchy-layout save [workspace]     # overwrite that workspace's node from the l
 omarchy-layout list                 # one line per workspace
 omarchy-layout order [workspace]    # bring built-in-layout workspaces to their profile tree
 omarchy-layout order --check        # report only, move nothing
+omarchy-layout center               # center hovered or active window in master layout
 ```
 
 `apply` does five things, and only the first one launches anything:
@@ -319,6 +320,18 @@ To re-apply the layout from the Omarchy menu, add this to
 
 The parent is inferred from the dotted id, so `layout` becomes a root entry and `layout.apply` its
 child.
+
+## Optional: keybinding
+
+To center the hovered window (or the active window) into Hyprland's `master` layout on demand, add this to `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + ALT + C", "Center window", "omarchy-layout center")
+```
+
+Hovering a tiled window and pressing the shortcut switches the workspace to `master` layout with `orientation = "center"` (persisting the rule in `~/.local/state/omarchy/workspace-layouts/<ws>.lua`), centers the hovered window at full height, and arranges the remaining windows into side columns. Pressing it again on a side window swaps that window into the centre. The target is the tiled window under the cursor on the cursor's monitor (a shown special workspace wins); hovering a floating window does nothing but notify, and hovering a gap falls back to the focused window. The cursor and the visible workspace are never moved. Workspaces with fewer than three windows keep the empty space (`master:slave_count_for_center_master` is 0), a fourth window stacks under the second and a fifth under the third. Return to `dwindle` at any time with Omarchy's standard layout toggle (`SUPER + L`).
+
+Unlike the persisted rule `apply` writes at login, the rule this command writes carries no `omarchy-layout` header, matching Omarchy's own layout toggle; `apply` rewrites the file (with the header) on the next login.
 
 ## Manual resizing
 
