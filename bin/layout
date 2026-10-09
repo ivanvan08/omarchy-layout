@@ -30,6 +30,10 @@ import time
 
 STATE_DIR = os.environ.get("OMARCHY_LAYOUT_STATE", os.path.expanduser("~/.local/state/omarchy/layout"))
 PROFILE_PATH = os.environ.get("OMARCHY_LAYOUT_PROFILE")
+WORKSPACE_LAYOUTS_DIR = os.environ.get(
+    "OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR",
+    os.path.expanduser("~/.local/state/omarchy/workspace-layouts"),
+)
 SOCK_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "hypr")
 INSTANCE = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
 LAYOUT_NAME = "omarchy-layout"
@@ -48,14 +52,27 @@ def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
+def profile_override() -> str | None:
+    return os.environ.get("OMARCHY_LAYOUT_PROFILE") or PROFILE_PATH
+
+
+def has_profile_override() -> bool:
+    return bool(profile_override())
+
+
+def workspace_layouts_dir() -> str:
+    return os.environ.get("OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR", WORKSPACE_LAYOUTS_DIR)
+
+
 def profile_file() -> str:
     """Personal profile first, committed example second.
 
     profiles/windows.json is git-ignored so a user's own app set never ends up in the public repo;
     profiles/example.json is the template that ships with it.
     """
-    if PROFILE_PATH:
-        return PROFILE_PATH
+    override = profile_override()
+    if override:
+        return override
     personal = personal_profile_file()
     if os.path.exists(personal):
         return personal
@@ -1044,7 +1061,8 @@ def cmd_apply(args) -> int:
             eval_lua(workspace_rule_lua(str(workspace), node, active_mode))
     persisted = write_workspace_layouts(profile, active_mode, args.dry_run)
     if persisted and not args.quiet:
-        print(f"persisted layout rules for {len(persisted)} workspace(s) in {os.path.dirname(persisted[0])}")
+        action = "would persist" if args.dry_run else "persisted"
+        print(f"{action} layout rules for {len(persisted)} workspace(s) in {os.path.dirname(persisted[0])}")
     if args.dry_run:
         for entry in profile.get("scratchpad") or []:
             print(f"[dry-run] launch {entry['exec']} -> special:scratchpad")
@@ -1254,21 +1272,62 @@ def workspace_rule_lua(workspace: str, node: dict, active_mode: str) -> str:
     return f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}" }})'
 
 
-def write_workspace_layouts(profile: dict, active_mode: str, dry_run: bool) -> list[str]:
+LAYOUT_HEADER_PREFIX = "-- written by omarchy-layout"
+
+
+def is_our_layout_file(path: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            line = handle.readline()
+        return line.startswith(LAYOUT_HEADER_PREFIX)
+    except OSError:
+        return False
+
+
+def write_workspace_layouts(
+    profile: dict, active_mode: str, dry_run: bool, directory: str | None = None
+) -> list[str]:
     """Persist the per-workspace layout rule the way Omarchy itself does.
 
     `~/.local/state/omarchy/workspace-layouts/<ws>.lua` is loaded by
     default/hypr/workspace-layouts.lua on every config load. Writing it here matters twice over:
     those files survive a reload, and the files left behind by the retired omarchy-session tool
     otherwise win the race and hand the workspace dwindle or scrolling instead of our layout.
+
+    Layout files are only persisted when running the default profile; with an override
+    (OMARCHY_LAYOUT_PROFILE set), rules apply at runtime only.
     """
-    directory = os.path.expanduser("~/.local/state/omarchy/workspace-layouts")
+    if has_profile_override():
+        return []
+
+    directory = directory or workspace_layouts_dir()
+    profile_workspaces = {str(ws) for ws in (profile.get("workspaces") or {}).keys()}
+
+    if os.path.isdir(directory):
+        for fname in sorted(os.listdir(directory)):
+            if not fname.endswith(".lua"):
+                continue
+            ws = fname[:-4]
+            if ws in profile_workspaces:
+                continue
+            path = os.path.join(directory, fname)
+            if not is_our_layout_file(path):
+                continue
+            if dry_run:
+                print(f"[dry-run] would delete stale layout rule {path}")
+            else:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
     written = []
     for workspace, node in (profile.get("workspaces") or {}).items():
         path = os.path.join(directory, f"{workspace}.lua")
+        rule_lua = workspace_rule_lua(str(workspace), node, active_mode)
         text = (
-            "-- written by omarchy-layout - https://github.com/ivanvan08/omarchy-layout\n"
-            f"{workspace_rule_lua(str(workspace), node, active_mode)}\n"
+            f"{LAYOUT_HEADER_PREFIX} - https://github.com/ivanvan08/omarchy-layout\n"
+            f"{rule_lua}\n"
         )
         if os.path.exists(path):
             with open(path) as handle:

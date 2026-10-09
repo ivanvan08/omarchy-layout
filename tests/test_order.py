@@ -287,5 +287,72 @@ class PlanSwaps(unittest.TestCase):
             self.assertLessEqual(len(swaps), 2, current)
 
 
+class WorkspaceLayoutPersistence(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved_dir = cli.WORKSPACE_LAYOUTS_DIR
+        self.saved_profile_path = cli.PROFILE_PATH
+        self.saved_env_profile = os.environ.get("OMARCHY_LAYOUT_PROFILE")
+        self.saved_env_layouts = os.environ.get("OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR")
+
+        cli.WORKSPACE_LAYOUTS_DIR = self.tmp.name
+        if "OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR" in os.environ:
+            del os.environ["OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR"]
+
+    def tearDown(self):
+        cli.WORKSPACE_LAYOUTS_DIR = self.saved_dir
+        cli.PROFILE_PATH = self.saved_profile_path
+        if self.saved_env_profile is not None:
+            os.environ["OMARCHY_LAYOUT_PROFILE"] = self.saved_env_profile
+        elif "OMARCHY_LAYOUT_PROFILE" in os.environ:
+            del os.environ["OMARCHY_LAYOUT_PROFILE"]
+
+        if self.saved_env_layouts is not None:
+            os.environ["OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR"] = self.saved_env_layouts
+        elif "OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR" in os.environ:
+            del os.environ["OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR"]
+
+        self.tmp.cleanup()
+
+    def test_override_profile_never_persists_layout_files(self):
+        profile = {"workspaces": {"1": {"class": "A"}}}
+        cli.PROFILE_PATH = "/tmp/fake-profile.json"
+        os.environ["OMARCHY_LAYOUT_PROFILE"] = "/tmp/fake-profile.json"
+
+        written = cli.write_workspace_layouts(profile, "external", dry_run=False)
+        self.assertEqual(written, [])
+        self.assertEqual(os.listdir(self.tmp.name), [])
+
+    def test_default_profile_persists_files_and_cleans_stale_files(self):
+        cli.PROFILE_PATH = None
+        if "OMARCHY_LAYOUT_PROFILE" in os.environ:
+            del os.environ["OMARCHY_LAYOUT_PROFILE"]
+
+        stale_path = os.path.join(self.tmp.name, "6.lua")
+        with open(stale_path, "w") as f:
+            f.write("-- written by omarchy-layout - https://github.com/ivanvan08/omarchy-layout\n")
+            f.write('hl.workspace_rule({ workspace = "6", layout = "lua:omarchy-layout" })\n')
+
+        foreign_path = os.path.join(self.tmp.name, "8.lua")
+        with open(foreign_path, "w") as f:
+            f.write('-- written by omarchy toggle\nhl.workspace_rule({ workspace = "8", layout = "dwindle" })\n')
+
+        profile = {"workspaces": {"1": {"class": "A"}}}
+
+        dry_written = cli.write_workspace_layouts(profile, "external", dry_run=True)
+        self.assertEqual(dry_written, [os.path.join(self.tmp.name, "1.lua")])
+        self.assertTrue(os.path.exists(stale_path))
+        self.assertTrue(os.path.exists(foreign_path))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "1.lua")))
+
+        written = cli.write_workspace_layouts(profile, "external", dry_run=False)
+        self.assertEqual(written, [os.path.join(self.tmp.name, "1.lua")])
+        self.assertFalse(os.path.exists(stale_path))
+        self.assertTrue(os.path.exists(foreign_path))
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "1.lua")))
+
+
 if __name__ == "__main__":
     unittest.main()

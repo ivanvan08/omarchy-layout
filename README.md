@@ -234,7 +234,10 @@ space itself, so the module only deals in boxes.
 Omarchy loads on every config load. Both mechanisms are kept in sync because a rule registered at
 runtime does not move a workspace that already exists: the layout of a workspace is fixed when the
 workspace is created. Files left there by an older tool otherwise win and hand the workspace `dwindle`
-or `scrolling`.
+or `scrolling`. Layout files are persisted only when running the default profile; with
+`OMARCHY_LAYOUT_PROFILE` set, rules apply at runtime only so temporary probe runs leave no files behind.
+When persisting, `apply` removes stale layout files carrying its header for workspaces no longer in the
+profile, while leaving unrelated files (such as Omarchy's layout toggles) untouched.
 
 ## Startup
 
