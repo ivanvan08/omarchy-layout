@@ -1660,30 +1660,50 @@ def plan_center_swap(
     return [(target_addr, master_addr)]
 
 
-def persist_workspace_layout_omarchy_style(
-    workspace: str, layout: str, layout_opts: dict | None = None
-) -> str | None:
-    """Persist workspace rule Omarchy-style without omarchy-layout header.
+def workspace_rule_target(ws_info: dict) -> tuple[str, str] | None:
+    """Selector that addresses a workspace in a rule, and the state-file key to persist it under.
 
-    Omarchy's layout toggle writes directly to ~/.local/state/omarchy/workspace-layouts/<ws>.lua
-    without a header. Writing the same format ensures the rule survives config reloads and
-    is never deleted by omarchy-layout's stale-rule pruning.
+    A special workspace must be addressed by NAME. Hyprland resolves a selector that looks numeric
+    as a workspace ID, and `CWorkspace::matchesStaticSelector` reads a leading `-` as the RELATIVE
+    form (`getWorkspaceIDNameFromString`: id = max(active - n, 1)), so `workspace = "-98"` matches
+    workspace 1, never the special workspace with id -98. Special workspaces are selected by name
+    (`selector.starts_with("special")` matches the workspace name), so the negative id never reaches
+    a rule: the name is used, and the file key is that name with path-hostile characters replaced.
     """
-    if not (workspace.isdigit() or (workspace.startswith("-") and workspace[1:].isdigit())):
+    ws_id = ws_info.get("id")
+    name = ws_info.get("name") or ""
+    if ws_id is not None and ws_id >= 0:
+        return str(ws_id), str(ws_id)
+    if not name:
         return None
+    return name, re.sub(r"[^A-Za-z0-9._-]", "-", name)
 
+
+def persist_workspace_layout_omarchy_style(
+    selector: str, file_key: str, layout: str, layout_opts: dict | None = None
+) -> str | None:
+    """Persist a workspace rule Omarchy-style: `<file_key>.lua`, no omarchy-layout header.
+
+    Omarchy's layout toggle writes `~/.local/state/omarchy/workspace-layouts/<ws>.lua` directly,
+    without a header. Writing the same shape keeps the rule across config reloads and out of
+    omarchy-layout's stale-rule pruning (which only deletes files carrying its header). The
+    selector in the rule text and the file key are separate: a special workspace is addressed by
+    name but cannot be named with a colon on disk.
+    """
+    if not file_key or not re.fullmatch(r"[A-Za-z0-9._-]+", file_key):
+        return None
     directory = workspace_layouts_dir()
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, f"{workspace}.lua")
+    path = os.path.join(directory, f"{file_key}.lua")
 
     if layout_opts:
         opts_lua = ", ".join(
             f'{k} = "{v}"' if isinstance(v, str) else f"{k} = {v}"
             for k, v in layout_opts.items()
         )
-        rule_lua = f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}", layout_opts = {{ {opts_lua} }} }})'
+        rule_lua = f'hl.workspace_rule({{ workspace = "{selector}", layout = "{layout}", layout_opts = {{ {opts_lua} }} }})'
     else:
-        rule_lua = f'hl.workspace_rule({{ workspace = "{workspace}", layout = "{layout}" }})'
+        rule_lua = f'hl.workspace_rule({{ workspace = "{selector}", layout = "{layout}" }})'
 
     text = f"{rule_lua}\n"
     tmp = path + ".tmp"
@@ -1717,6 +1737,10 @@ def cmd_center(args) -> int:
     `hyprctl eval`, so the geometry read next is already the master one) and is persisted
     Omarchy-style. The target then swaps with the current master. `hl.dsp.window.swap` warps the
     cursor to the swapped window, so the same eval puts the cursor back where it was.
+
+    A special workspace (negative id) is addressed by name, never by id: `workspace = "-98"` is the
+    RELATIVE form and resolves to `max(active - 98, 1)` (see workspace_rule_target), which is how an
+    earlier version switched the user's workspace 1 instead of the scratchpad.
     """
     cursor = cursor_position()
     monitors_list = hyprctl_json("monitors") or []
@@ -1731,23 +1755,27 @@ def cmd_center(args) -> int:
         return 0
 
     ws_info = target.get("workspace") or {}
-    ws_key = str(ws_info.get("id")) if ws_info.get("id") is not None else str(ws_info.get("name"))
+    target_ws = workspace_rule_target(ws_info)
+    if not target_ws:
+        send_notification("Centre window: this workspace has no addressable rule target")
+        return 0
+    ws_selector, ws_file_key = target_ws
     monitor = next((m for m in monitors_list if m.get("id") == target.get("monitor")), None)
     mid = workarea_mid_x(monitor)
 
     def tiled_here(items: list[dict]) -> list[dict]:
-        return [c for c in items if c.get("mapped") and not c.get("floating") and on_workspace(c, ws_key)]
+        return [c for c in items if c.get("mapped") and not c.get("floating") and on_workspace(c, ws_selector)]
 
     tiled = tiled_here(clients_list)
     workspaces = hyprctl_json("workspaces") or []
-    info = next((w for w in workspaces if str(w.get("id")) == ws_key or w.get("name") == ws_key), {})
+    info = next((w for w in workspaces if str(w.get("id")) == ws_selector or w.get("name") == ws_selector), {})
     master = identify_master_window(tiled, mid)
     if info.get("tiledLayout") != "master" or not (master and is_centered(master, mid)):
         eval_lua(
-            f'hl.workspace_rule({{ workspace = "{ws_key}", layout = "master", '
+            f'hl.workspace_rule({{ workspace = "{ws_selector}", layout = "master", '
             f'layout_opts = {{ orientation = "center" }} }}); '
         )
-        persist_workspace_layout_omarchy_style(ws_key, "master", {"orientation": "center"})
+        persist_workspace_layout_omarchy_style(ws_selector, ws_file_key, "master", {"orientation": "center"})
         tiled = tiled_here(clients())
         master = identify_master_window(tiled, mid)
 

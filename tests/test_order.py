@@ -6,6 +6,7 @@ Run: python3 -m unittest tests/test_order.py
 import importlib.util
 import itertools
 import os
+import re
 import unittest
 from importlib.machinery import SourceFileLoader
 
@@ -517,6 +518,127 @@ class CenterCommandSelection(unittest.TestCase):
         self.assertTrue(cli.is_centered(offset, mid))  # 28 px off, inside the 32 px tolerance
         off = dict(self.tiled_center, at=[900, 42])
         self.assertFalse(cli.is_centered(off, mid))  # 88 px off
+
+
+SPECIAL = "special:scratchpad"
+
+
+def scratchpad_window(address, klass, at, size):
+    return {
+        "address": address,
+        "class": klass,
+        "at": at,
+        "size": size,
+        "workspace": {"id": -98, "name": SPECIAL},
+        "floating": False,
+        "mapped": True,
+        "monitor": 0,
+    }
+
+
+# Dwindle-ish geometry: A | C with B sharing the middle, so the cursor can sit on C.
+SPECIAL_BEFORE = [
+    scratchpad_window("0xa01", "A", [12, 42], [1266, 1386]),
+    scratchpad_window("0xa02", "B", [1292, 42], [1266, 1386]),
+    scratchpad_window("0xa03", "C", [2567, 42], [2541, 1386]),
+]
+# After the switch: B is the centred master, A left, C right.
+SPECIAL_AFTER = [
+    scratchpad_window("0xa01", "A", [12, 42], [900, 1386]),
+    scratchpad_window("0xa02", "B", [967, 42], [1266, 1386]),
+    scratchpad_window("0xa03", "C", [2245, 42], [943, 1386]),
+]
+SPECIAL_MONITOR = {
+    "id": 0,
+    "name": "Virtual-1",
+    "x": 0,
+    "y": 0,
+    "width": 3200,
+    "height": 900,
+    "scale": 1,
+    "reserved": [0, 30, 0, 0],
+    "activeWorkspace": {"id": 1, "name": "1"},
+    "specialWorkspace": {"id": -98, "name": SPECIAL},
+}
+
+
+class CenterSpecialWorkspace(unittest.TestCase):
+    """The real cmd_center against a faked compositor, on a scratchpad (negative workspace id)."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved_dir = cli.WORKSPACE_LAYOUTS_DIR
+        self.saved_env = os.environ.pop("OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR", None)
+        cli.WORKSPACE_LAYOUTS_DIR = self.tmp.name
+
+        self.evals = []
+        self.pending = [SPECIAL_BEFORE, SPECIAL_AFTER]
+        self.layouts = [{"id": -98, "name": SPECIAL, "tiledLayout": "dwindle"}]
+        self.saved = (cli.cursor_position, cli.clients, cli.hyprctl_json, cli.eval_lua, cli.send_notification)
+
+        def read_clients():
+            frame = self.pending.pop(0) if len(self.pending) > 1 else self.pending[0]
+            return [dict(c) for c in frame]
+
+        cli.cursor_position = lambda: (3837, 735)  # inside C of SPECIAL_BEFORE
+        cli.clients = read_clients
+        cli.hyprctl_json = lambda *args: (
+            [SPECIAL_MONITOR] if args == ("monitors",) else self.layouts
+        )
+        cli.eval_lua = lambda lua: (self.evals.append(lua), True)[1]
+        cli.send_notification = lambda *a, **k: None
+
+    def tearDown(self):
+        cli.cursor_position, cli.clients, cli.hyprctl_json, cli.eval_lua, cli.send_notification = self.saved
+        cli.WORKSPACE_LAYOUTS_DIR = self.saved_dir
+        if self.saved_env is not None:
+            os.environ["OMARCHY_LAYOUT_WORKSPACE_LAYOUTS_DIR"] = self.saved_env
+        self.tmp.cleanup()
+
+    def test_a_special_workspace_is_addressed_by_name_and_never_by_its_negative_id(self):
+        cli.cmd_center(None)
+        rules = [lua for lua in self.evals if "workspace_rule" in lua]
+        self.assertEqual(len(rules), 1, self.evals)
+        self.assertIn(f'workspace = "{SPECIAL}"', rules[0])
+        swaps = [lua for lua in self.evals if "window.swap" in lua]
+        self.assertEqual(len(swaps), 1, self.evals)
+        self.assertIn("0xa03", swaps[0])  # the hovered window C
+        self.assertIn("0xa02", swaps[0])  # the master B
+        for lua in self.evals:
+            self.assertIsNone(re.search(r"-\d", lua), lua)
+
+    def test_the_written_rule_has_no_negative_number_anywhere(self):
+        cli.cmd_center(None)
+        files = os.listdir(self.tmp.name)
+        self.assertEqual(files, [f"{SPECIAL.replace(':', '-')}.lua"], files)
+        for name in files:
+            self.assertFalse(name.startswith("-"), name)
+        with open(os.path.join(self.tmp.name, files[0])) as handle:
+            text = handle.read()
+        self.assertEqual(text.count("workspace_rule"), 1, text)
+        self.assertIn(f'workspace = "{SPECIAL}"', text)
+        self.assertIn('layout = "master"', text)
+        self.assertIn('orientation = "center"', text)
+        self.assertIsNone(re.search(r"-\d", text), text)
+
+    def test_an_already_centred_special_workspace_writes_nothing(self):
+        self.pending = [SPECIAL_AFTER]
+        self.layouts = [{"id": -98, "name": SPECIAL, "tiledLayout": "master"}]
+        cli.cursor_position = lambda: (1600, 735)  # inside the centred master B
+        cli.cmd_center(None)
+        self.assertEqual(self.evals, [])
+        self.assertEqual(os.listdir(self.tmp.name), [])
+
+    def test_rule_target_derivation(self):
+        self.assertEqual(cli.workspace_rule_target({"id": 3, "name": "3"}), ("3", "3"))
+        self.assertEqual(
+            cli.workspace_rule_target({"id": -98, "name": SPECIAL}), (SPECIAL, "special-scratchpad")
+        )
+        self.assertEqual(cli.workspace_rule_target({"id": 7, "name": "web"}), ("7", "7"))
+        self.assertIsNone(cli.workspace_rule_target({"id": -98, "name": ""}))
+
 
 if __name__ == "__main__":
     unittest.main()
